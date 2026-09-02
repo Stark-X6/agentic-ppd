@@ -1,0 +1,9 @@
+# Local clones and large experiment artifacts
+components/
+artifacts/
+results/
+logs/
+*.log
+*.csv
+*.jsonl
+.env

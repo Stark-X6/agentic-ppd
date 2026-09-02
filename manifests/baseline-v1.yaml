@@ -1,0 +1,38 @@
+schema_version: 1
+baseline:
+  name: agentic-ppd-baseline-v1
+  frozen_date: "2026-09-02"
+  purpose: "Live SWE-bench agent profiling on PPD before TTL/Dynamic policy changes"
+
+components:
+  vllm_ppd:
+    local_path: /root/vllm-ppd
+    upstream: https://github.com/freelulul/vllm-ppd.git
+    intended_fork: https://github.com/Stark-X6/vllm-ppd.git
+    branch: baseline/agentic-ppd-v1
+    tag: agentic-ppd-baseline-v1
+    commit: fbfb9a19992438f6be0a439e8d125b5e81463891
+  uni_agent:
+    local_path: /root/uni-agent
+    upstream: https://github.com/verl-project/uni-agent.git
+    intended_fork: https://github.com/Stark-X6/uni-agent.git
+    branch: baseline/agentic-ppd-v1
+    tag: agentic-ppd-baseline-v1
+    commit: 7e5145b5d25e351b57b6a1b61fc6877873b77990
+
+model:
+  path: /root/autodl-tmp/Qwen3-30B-A3B-Thinking-2507
+  dtype: bfloat16
+  max_model_len: 155648
+
+agent:
+  max_context_len: 155648
+  max_total_tokens: 131072
+  max_tokens_per_turn: 16384
+  temperature: 0.0
+
+validation:
+  python_compile: passed
+  shell_syntax: passed
+  diff_check: passed
+  pytest: not_run_missing_dependency
