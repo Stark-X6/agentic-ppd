@@ -4,19 +4,21 @@
 
 ## 结论
 
-小规模 live smoke 和修正 calibration loader 后的原始 Dynamic c=36 baseline 已完成。结果证明 reasoning replay、精确 append 计数、三源 profiling join 和 Dynamic 路由链路都能工作；原始 Dynamic 在本次 live Agent workload 上仍然 100% 选择 PPD，行为退化为静态 `x=1`。
+严格 editor contract 的 live smoke 和正式 Static PPD `x=1`、16 episodes、concurrency=16 实验均已完成。Agent 数据契约可以冻结：正式 run 的 297 个 response 全部是 `think+tool`，281/281 个可回放 transition 精确带回 reasoning；322/322 个工具调用成功，旧 editor 的 `insert` 缺字段错误降为 0。
 
-本轮也得到此前没有出现过的强 cache-pressure 证据：553 个可判断 transition 中有 379 个 retention 低于 90%，其中 366 个低于 50%。cache loss 与接近满载的 KV、排队以及长 LLM 延迟明显相关。这使 TTL 成为有依据的后续方向，但当前数据也表明“只按工具执行时间设置 TTL”不够，因为不少 cache loss 发生在极短工具间隔之后。
+正式 c=16 确实产生了清晰 cache pressure：280 个可判断 transition 中 140 个 retention 低于 90%，其中 131 个低于 50%。但这些 loss 几乎全部集中在一个节点。conversation affinity 将 16 个 episode 分成 8200 上 11 个、8201 上 5 个；8200 为 139/171 loss、110 次 preemption，8201 仅为 1/109 loss、0 次 preemption。因此，这次 run 是有效的“路由倾斜/单节点压力”基线，却不能单独证明均衡负载下 c=16 就是合适的 knee。
 
-c=36 中曾出现 215 次缺少 `new_str` 的本地 `format_error`，集中在 6 个 episode，并使 5 个 episode 达到 `max_steps=50`。这些错误没有调用 Modal，却制造了额外 LLM 请求和人为 cache 压力。editor 模型可见接口现已拆成五个具有无条件必填字段的工具；CPU contract smoke 已通过，下一步只需先做小规模 live smoke，确认模型端行为，再建立同一 Agent commit 下的静态对照。
+工具端已不是瓶颈：工具时延 p50/p90/max 为 1.70/3.32/10.57 s，LLM 时延为 41.0/111.5/755.0 s；按 episode 累加时间，LLM 占 95.0%，工具占 3.8%，toolbox setup 占 1.1%。cache loss 后下一轮 LLM p50 为 62.3 s，retention≥90% 时为 13.5 s；两组前一轮工具时间 p50 分别为 1.71 s 和 1.81 s。当前 loss 更接近 KV 满载、排队和 preemption，而不是“工具执行太久”。
+
+在重跑 matched Dynamic 前，需要先固定 sample→node 映射。当前 proxy 的节点选择使用 Python `hash()`，conversation hash 又包含每次不同的 `run_id`/epoch，节点列表还依赖注册顺序；所以重启后即便使用相同 16 个样本，也不能复现本次 11/5 分配。若直接比较 wall time，路由倾斜会成为比 Dynamic 策略更大的混杂变量。
 
 当前代码状态：
 
 - uni-agent 分支：fix/agent-tool-contract
-- uni-agent 本地最新提交：4f25cdf Split editor into strict operation-specific tools
+- uni-agent 最新提交：4f25cdf Split editor into strict operation-specific tools
 - vllm-ppd 分支：fix/agent-tool-contract
-- vllm-ppd 本地最新提交：f40722674 Classify split editor tools in profiling
-- 两个仓库的 agentic-ppd-baseline-v1 tag 均保持不变
+- vllm-ppd 最新提交：ac30818d0 Use v2 analyzer for run-scoped Agent profiles
+- 两个代码仓库的 agentic-ppd-baseline-v1 tag 均保持不变
 
 ## 一、Agent 侧已经完成的修改
 
@@ -119,25 +121,29 @@ CPU contract smoke 已验证：五个 schema 的 required 集合、缺少 `inser
 
 ## 二、Agent 侧验收结果与保留的技术债
 
-### 已完成的 live smoke
+### 已完成的 live smoke 与正式验收
 
-修正后的 c=2 smoke 位于：
+修正 append/reasoning 后的 Dynamic c=2 smoke 位于：
 
 `/root/vllm-ppd/logs/runs/dynamic_smoke_corrected_flat_c2_20260906T044159Z`
 
+它验证了 Turn 1 `pd`、Turn 2+ `ppd_dynamic`、精确 append tokenizer、reasoning replay 和三源 join；2/2 episode 自然结束，没有 timeout。
+
+editor 拆分后的 Static c=2 live smoke 位于：
+
+`/root/vllm-ppd/logs/runs/static_x1_editor_split_smoke_c2_20260906T073603Z`
+
 验证结果：
 
-- 2/2 episode 自然结束，无 timeout 和请求错误；
-- 18/18 step 均有 reasoning；
-- 16/16 可回放 transition 与下一轮实际 request 完全一致；
-- 18/18 工具调用成功，15/15 editor 调用含 path；
-- Turn 1 为 2 次 `pd`，Turn 2+ 为 16 次 `ppd_dynamic`；
-- 18/18 proxy row 使用精确 tokenizer，且 `ppd_mode_enabled=true`；
-- 没有误注册为 `ppd_direct`。
+- 2/2 episode 正常结束；
+- 33/33 工具调用成功，无 `format_error`；
+- 31/31 相邻 transition 的 reasoning 精确回放；
+- 路由为 2 次 Turn 1 `ppd` 和 31 次 Turn 2+ `ppd_direct`；
+- 小规模下没有 cache loss。
 
-因此 reasoning replay、role=tool append、精确 tokenizer、cached-token retention 计算和 Dynamic 路由链路均已验证。
+正式 Static c=16 run 又覆盖了 322 次工具调用，包括 193 次 replace、50 次 view、13 次 create、9 次 insert 和 4 次 undo，全部成功。它不仅验证 schema 能被模型接受，也验证五个 wrapper 在真实多轮任务中的数据面行为。
 
-该 c=2 smoke 发生在 editor 拆分之前，而且没有触发 `insert`。现在直接 CPU contract smoke 已覆盖五个新接口；后续 live smoke 的任务是验证模型是否能稳定选择新工具并生成完整 arguments，而不是再次依赖自然探索来覆盖全部操作。
+因此当前 Agent 状态应定义为：reasoning、trace、token、Modal 边界和 editor contract 均已 live 验收，可以冻结用于 serving 对照实验。
 
 ### 非阻塞技术债
 
@@ -146,7 +152,7 @@ CPU contract smoke 已验证：五个 schema 的 required 集合、缺少 `inser
 - 语义错误工具调用仍需要模型或 Agent policy 改进。
 - Modal 抖动只能拆分和统计，无法由 Agent 代码彻底消除。
 
-因此当前 Agent 状态应定义为：reasoning、trace、token、Modal 边界和 editor 的代码级契约已验收；editor split 还差一个小规模 live smoke，之后即可冻结用于新的 matched serving 实验。
+这些技术债不阻塞 serving profiling。后续若没有发现新的 trace 契约错误，不再改变 Agent commit；所有 Static、Dynamic 和 TTL 对照都固定使用当前 Agent 版本。
 
 ## 三、PPD 侧已经完成的修复
 
@@ -208,13 +214,29 @@ append 使用与模型一致的 tokenizer 和 chat template 计数，解决了 A
 
 ## 四、PPD 当前的核心问题
 
-### P0：原始 Dynamic baseline 已重跑，但同版本静态对照缺失
+### P0：静态基线已建立，但跨配置节点分配尚不可复现
 
-QPS≤4 的 72 对 matched 数据已完整加载，corrected Dynamic c=36 也已完成。558 次 Turn 2+ 物理决策全部选择 PPD，因此“原始 Dynamic 在该 live Agent workload 上退化为静态 `x=1`”已经得到验证。
+严格 editor contract 下的 Static `x=1`、c=16、前 16 条 SWE-bench run 已完成，原始 Dynamic 则仍只有旧 editor contract 下的 c=36 结果。因此下一项算法实验仍是重跑相同样本的原始 Dynamic。
 
-不过，这次 run 使用了新的 reasoning replay、精确 append tokenizer 和 editor schema；旧的 static x=1 c=36 不是同一 Agent contract。两者的上下文、生成轨迹和节点负载不匹配，不能用旧静态结果做严格性能归因。若要比较 Static、Dynamic 和 TTL，仍需用修好 editor 接口后的同一 commit 重跑 static x=1。
+不过，正式 Static run 暴露出 matched A/B 更基础的数据契约问题。当前 `comprehensive_proxy.py`：
 
-QPS 6～20 仍无 clean calibration，但本轮 lifetime QPS 最大只有 0.312，全部映射到 0.5 档，因此高 QPS calibration 缺失没有直接影响本轮决策。
+1. 用 `run_id | conversation_id | PPD_PROXY_EPOCH` 生成 conversation hash；Static 和 Dynamic 的 run_id 不同，因此 hash 本身不同；
+2. 用 Python `hash(conv_hash) % len(servers)` 选节点；未设置 `PYTHONHASHSEED` 时，不同 proxy 进程的 hash secret 不同；
+3. `prefill_instances`/`decode_instances` 从 ZMQ 注册字典直接转 list，索引对应的物理端口受注册先后影响。
+
+这三点意味着重启 stack 后不能复现相同 sample→decode-node 映射。本次 16 个 episode 恰好分成 11/5；公平二项哈希下出现 11/5 或更极端分配的概率约为 21%，并非罕见异常，但在每节点只有 156672 KV tokens 时足以把一侧推入持续 preemption、另一侧保持几乎无 loss。
+
+matched 实验前应把“状态隔离 key”和“稳定路由 key”分开：
+
+- state key 继续包含 run_id/epoch，防止跨 run 继承 turn counter；
+- routing key 使用固定 comparison set、稳定 episode identity 和显式 routing seed，经 `hashlib` 计算，不使用 Python `hash()`；
+- 所有 server list 先按地址排序；
+- proxy log 写入 routing key、bucket、seed、排序后的候选节点和最终 assignment；
+- paired Static/Dynamic 使用同一份预先确定的 mapping。若要强制 8/8，应在实验前生成并冻结 mapping，而不是根据运行结果临时挑 seed。
+
+这是实验可复现性修复，不改变 Dynamic 决策本身。保留一个兼容开关即可继续复现原始 hash 行为。另一种不改代码的办法是每个配置跑多个 routing seed 并报告置信区间，但在当前 GPU 成本和 n=16 下不划算。
+
+QPS 6～20 仍无 clean calibration；不过现有 Agent run 的 lifetime QPS 均映射到 0.5 档，所以它不影响当前原始 Dynamic 路径是否可执行。它仍限制更高流量场景的结论外推。
 
 ### P1：Dynamic 的特征不适配 live Agent
 
@@ -419,64 +441,182 @@ Modal sandbox create p50/max 为 0.854/0.964 s，toolbox setup p50/max 为 11.2/
 - 70.6 s 全是 KV 重算开销，因为当前没有把 queue、recompute 和 decode 单独计时；
 - cache miss 是 offload/restore，因为当前 baseline 没有 Continuum offload 路径，现有证据只支持“本地 cache 未保留并需要重新处理”。
 
-### 7. reasoning replay 后的并发定位
+### 7. c=36 后的并发定标假设及其更新
 
-应该降低主实验的 concurrency，并把 c=36 保留为 overload/stress 上界，而不是直接作为唯一 A/B 点。corrected c=36 中 retention<90% 已达 68.5%，两个 decode 节点 active-window KV p90 约 98%，8201 有 87.7% 的采样点 waiting>0，并累计 254 次 preemption；此时 queue saturation、节点长尾和 KV eviction 已高度耦合，TTL 即使有效也可能被整体过载掩盖。
+corrected Dynamic c=36 中 retention<90% 已达 68.5%，两个 decode 节点 active-window KV p90 约 98%，最重节点有 87.7% 的采样点 waiting>0 和 254 次 preemption。因此 c=36 只适合作为 overload/stress 上界，不适合作为唯一主对照点。
 
-reasoning replay 前的旧 c=36 run 与新 run 不可直接比较，但可用于粗略定标：prompt p50 从 10309 增至 24684，约为 2.39 倍。按“并发 × 中位上下文”保持相近常驻 token 压力估算：
+当时根据 reasoning replay 前后 prompt p50 从 10309 增至 24684，曾用 `36 × 10309 / 24684 ≈ 15.0` 粗略选择 c=16 作为首个校准点。这个选择已完成实测，但新结果表明“总并发 × 全局中位上下文”不足以定 knee：conversation affinity 将 c=16 分成局部 11/5，使一台节点严重 loss、另一台几乎无 loss。
 
-`36 × 10309 / 24684 ≈ 15.0`
+因此旧的 5%/20% loss 选点阈值仍可作为工程准则，但必须在 deterministic、最好平衡的 sample→node mapping 下应用。当前 c=16 的结论和新的实验顺序见下一节及第七节。
 
-因此 c=16 是 editor 修复后最合理的首个校准点，而不是凭经验直接回到 c=12，也不应直接继续用 c=36。这个换算只是起点，因为轨迹长度、哈希分配、生成长度和工具间隔都变了。
+## 六、2026-09-06 strict-editor Static x=1、matched16 c=16 结果
 
-建议固定 SWE-bench 前 36 条和所有模型参数，仅改变并发上限：先 c=16；若 retention<90% 少于约 5%，再试 c=20、必要时 c=24；若 c=16 已超过约 20% 且 waiting 明显，再补 c=12。最终保留两个点：
+### 1. 实验配置与完整性
 
-- knee/正常负载点：有可测 cache loss，但没有 timeout、持续排队或大规模 preemption，用于 Static/Dynamic 的主要对照；
-- stress 点：cache loss 明显但尚未全面饱和，用于放大 TTL 效果；c=36 只作为过载参照，除非 editor 修复后的新 run 证明它已不再饱和。
+正式 run：
 
-阈值 5%/20% 是实验选点准则，不是论文算法参数。所有比较必须在 editor split 后重新采集；旧 c=36 的 379 次 loss 可以证明问题存在，却不能作为修复后算法的严格基线。
+`/root/vllm-ppd/logs/runs/static_x1_editor_split_matched16_c16_20260906T123720Z`
 
-## 六、建议的后续顺序
+参数为 Qwen3-30B-A3B-Thinking-2507、BF16、2P_2pD、静态 `x=1`、155648 context、131072 episode completion budget、16384 per turn、temperature=0、SWE-bench Verified 前 16 条、16 workers、concurrency=16。两个 pD 节点各有 156672-token KV capacity。
 
-### 阶段 1：验收 Agent editor contract
+| 指标 | 结果 |
+|---|---:|
+| traces | 16/16 |
+| driver wall | 1667.5 s（27 分 47 秒） |
+| trace 覆盖窗口 | 1593.0 s |
+| termination | 15 finished / 1 max_steps |
+| resolved / WA / timeout | 0 / 16 / 0 |
+| logical LLM steps | 297 |
+| physical proxy attempts | 298 |
+| tool calls | 322，全部成功 |
+| cumulative prompt tokens | 7,522,657 |
+| completion tokens | 381,785 |
+| final-context token sum | 572,190 |
 
-五工具拆分和 CPU contract smoke 已完成。先跑 c=2 live smoke，重点检查工具名、arguments、format_error、undo、reasoning replay 和 analyzer 分类；通过后冻结 Agent commit。
+`cumulative prompt tokens` 会在每轮重复统计历史，只代表 server 实际收到的各请求 prompt 之和。16 条样本恰好全部来自 astropy；同样的前 16 条在旧 corrected Dynamic c=36 中也全部为 WA，因此 0/16 不是 editor split 已知回归，但这个连续切片不能代表完整 SWE-bench 质量。这里应把它作为 serving profile set，而不是模型能力评测。
 
-### 阶段 2：重新选择并发并建立同版本对照
+run 目录现在包含 16 个 schema-v3 trace、`analysis.txt`、`aggregate_summary.json`、`metrics.csv`、`proxy_timing.jsonl` 和已固化的 `server_logs/`。
 
-固定前 36 个 SWE-bench episode，不因并发变化而改变样本集合。先以 static x=1、c=16 运行；根据 cache loss、waiting、preemption 和 timeout 决定是否升到 c=20/24 或降到 c=12。选定 knee 后，在完全相同的模型、Agent commit、样本、temperature 和 token 参数下分别重跑 static x=1 与原始 Dynamic。必要时另保留一个非饱和 stress 点用于 TTL；不要把旧的 polluted c=36 当严格性能对照。
+### 2. Agent、工具与 Modal
 
-### 阶段 3：增强决策 profiling，但不改变策略
+- 297/297 response 都是 `think+tool`；
+- 281/281 个可验证的相邻 transition 精确回放 reasoning；
+- 322/322 工具调用为 `ok`，`format_error=0`；
+- 工具分布为 replace 193、view 50、shell python 24、grep 14、create 13、insert 9、undo 4、submit 15。
 
-每个请求增加：
+| operation | count | p50 | p90 | max |
+|---|---:|---:|---:|---:|
+| editor:str_replace | 193 | 1.65 s | 2.80 s | 5.46 s |
+| editor:view | 50 | 2.08 s | 2.40 s | 4.36 s |
+| editor:insert | 9 | 2.75 s | 4.37 s | 5.40 s |
+| editor:create | 13 | 1.84 s | 2.35 s | 3.25 s |
+| shell:python | 24 | 3.42 s | 6.08 s | 10.57 s |
+| shell:grep | 14 | 2.46 s | 3.49 s | 3.98 s |
 
-- decision_source
-- selected_context_class
-- selected_workload
-- selected_qps_point
-- calibration_found
-- requested_max_tokens
-- previous_actual_completion
-- lifetime_qps
-- window_qps
-- active_episodes
-- waiting
-- kv_usage
-- queue_time / recompute-prefill time / decode time
+Modal 也没有早期的几十秒长尾：sandbox create p50/max 为 0.864/0.910 s，app lookup 为 0.899/1.090 s，fs read p50/p90/max 为 0.543/1.334/3.092 s，fs write为 0.880/1.358/1.989 s。
 
-同时修复 retry 的 logical-turn 幂等性和 prefill-only 内部 500。
+LLM 每步 p50/p90/p99 为 41.0/111.5/243.4 s；最大逻辑 step 755.0 s 来自一次 631.9 s 的严格 tool-call 解析失败，加 123.1 s `tool_choice=auto` 重试，不能当成单次物理推理。全 run 的 episode 累加时间中，LLM/工具/setup 分别占 95.0%/3.8%/1.1%。
 
-### 阶段 4：Agent-compatible Dynamic ablation
+### 3. 路由与仍存在的协议异常
+
+| 路由 | 次数 |
+|---|---:|
+| Turn 1 `ppd` | 16 |
+| Turn 2+ `ppd_direct` | 282 physical attempts |
+
+297 个逻辑 request 对应 298 个 proxy row，因为有 1 个 tool-choice retry。首次物理 attempt 返回 500，重试成功；proxy 仍把它从 turn 4 记成 turn 5，说明 retry logical-turn 幂等性问题尚未修复。
+
+此外，16/16 个 Turn 1 的 producer 子请求仍记录 `prefill_status=500`，但外部 decode 均成功。原因仍是 prefill-only 请求把生成上限设为 1，却保留 `tool_choice=required`：KV transfer 已发生，随后严格 JSON tool-call 解析失败。这不是本次 16 个 episode 的外部失败，但会污染错误率和日志语义，进入 PPD 修改阶段后应修复。
+
+### 4. Cache loss 与节点倾斜
+
+retention 定义保持为：
+
+`next_cached_tokens / previous(prompt_tokens + replayed completion_tokens)`
+
+281 个相邻 transition 中有 280 个可判断；tool-choice retry 的首次失败 response 没有 usage，因此按 analyzer 契约记为 unknown，未被错误当成 warm-cache 命中。
+
+| 指标 | 结果 |
+|---|---:|
+| 可判断 transitions | 280 |
+| retention < 90% | 140（50.0%） |
+| retention < 50% | 131（46.8%） |
+| 涉及 episodes | 12/16 |
+| cached tokens=976 的 loss | 110/140 |
+| event-level lost-token sum | 3,271,354 |
+
+`lost-token sum` 是每个 transition 暴露的重复重算量；同一前缀可能被多次计数，不能解释成唯一 KV 容量或直接节省量。
+
+| pD | episodes | requests | known/loss | active-window KV p50/p90/max | waiting>0 | waiting p50/max | preemptions |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 8200 | 11 | 184 | 171 / 139（81.3%） | 88.9% / 97.9% / 100% | 75.7% | 2 / 5 | 110 |
+| 8201 | 5 | 114 | 109 / 1（0.9%） | 49.4% / 68.6% / 82.3% | 0.5% | 0 / 1 | 0 |
+
+8200/8201 的 final-context token sum 分别为 376533/195657；它们不是同一时刻的 resident KV，不能直接与容量相除，但配合 11/5 同时启动、KV=100%、waiting 和 preemption，足以解释两节点完全不同的 cache 行为。8200 episode duration p50 为 1362 s，8201 为 593 s；该差异同时受任务轨迹影响，不能全部归因于 serving。
+
+压力与 loss 的共现非常强：
+
+- `waiting_max=0` 的 111 个 transition 中仅 1 个 loss；`waiting_max=3..5` 的 107 个 transition 全部 loss；
+- 同节点窗口内另有 0～3 个 active episode 时 80/80 无 loss；另有 5～9 个时 72/72 loss；
+- loss transition 的 KV usage max p50 为 99.2%、waiting max p50 为 4；retained transition 分别为 63.9% 和 0；
+- loss 后 LLM p50/p90 为 62.3/115.5 s，retained 时为 13.5/64.1 s，median 相差 4.6 倍；
+- loss 与 retained 两组的前序工具时间 p50 为 1.71/1.81 s，几乎相同。
+
+这些是强相关证据，不是独立因果分解：当前 LLM time 同时包含 queue、prefix recompute/prefill 和 decode。但它已足以排除“长工具调用是主要驱逐原因”。
+
+### 5. 对 concurrency 和 TTL 的含义
+
+总 concurrency=16 实际变成局部 concurrency 约 11/5。本 run 因此同时给出一个过载节点和一个近似无 loss 节点，是很有价值的 TTL/调度诊断样本；但它没有定位均衡条件下的 knee。
+
+每个 pD 只有 156672 tokens KV。当前 prompt p50 已是 25432，且一轮可再生成数千 token；从容量量级看，平均 8 个长对话/节点的 c=16 很可能已经是 stress 点，平均 6 个/节点的 c=12 更接近 knee 候选。这个估计不能替代固定映射后的实测，因为 episode 长度和到达间隔差异很大。
+
+TTL policy 可以改变“内存紧张时保留谁”，所以当前 loss 形态支持继续测试 TTL；但仅设置过期时间不会创造显存。当 11 个长上下文同时争用 156672 tokens 时，要显著降低总重算还可能需要：均衡 admission、KV offload/restore、压缩，或降低本地并发。Continuum 路径若包含 offload，必须把 eviction、offload、restore 和 recompute 分开记录。
+
+### 6. 本轮可以和不能得出的结论
+
+可以得出：
+
+- strict editor contract 已通过真实并发 workload，旧 format-error 污染被清除；
+- Static `x=1` 的 cache loss 在局部并发和 KV 压力升高时出现，并伴随 waiting/preemption/LLM 长尾；
+- 工具和 Modal 不是当前 wall-clock 瓶颈；
+- c=16 可作为 routing-skew stress 样本，但不是已确认的均衡 knee。
+
+不能得出：
+
+- Static 比 Dynamic 快或慢，因为尚无相同 editor contract、稳定 sample→node mapping 的 Dynamic pair；
+- c=16 在任意 hash seed 下都会有 50% loss；
+- loss 后多出的约 49 s median 全是 KV recompute；
+- TTL 单独即可消除 loss，或 0/16 score 是 serving 算法导致。
+
+## 七、建议的后续顺序
+
+### 阶段 1：冻结 Agent contract（已完成）
+
+CPU contract smoke、c=2 live smoke 和正式 c=16 均已通过。固定 uni-agent `4f25cdf` 及当前 YAML，不再把 Agent 改动混入 serving A/B。
+
+### 阶段 2：修复并冻结实验路由契约
+
+在不改变 PPD/Dynamic 决策的前提下：
+
+1. 分离 state key 与 deterministic routing key；
+2. 排序 server 地址，使用稳定 `hashlib` 和显式 routing seed；
+3. 记录完整 mapping 元数据；
+4. 预先冻结前 16 条在两台 decode 上的 assignment，并让 paired configs 共用。
+
+原始 hash 行为保留开关，当前 c=16 run 保留为 pre-fix stress baseline。若坚持完全不改 proxy，则至少每个配置跑多个 hash seed，不能拿单次 11/5 与另一单次随机分配比较。
+
+### 阶段 3：确定 balanced knee/stress，并跑 matched Dynamic
+
+仍使用相同前 16 条、模型、BF16、temperature=0 和 token 参数。建议在固定 8/8 映射下先复测 Static c=16：
+
+- 若 loss 仍高于约 20%且持续 waiting/preemption，把 c=16 定义为 stress，再测 c=12 作为 knee；
+- 若 c=16 只有可测但不饱和的 loss，可直接作为 knee；
+- 选定点后立刻用完全相同 mapping 跑原始 Dynamic 2P_2D。
+
+原始 Dynamic 预计仍 100% 选择 PPD；这轮的目的，是在严格控制 routing 和 Agent contract 后验证它是否等价退化为 `x=1`，并量化 Dynamic decision overhead，而不是期待它自动解决 eviction。
+
+### 阶段 4：补齐 PPD 请求级 profiling/协议语义
+
+不改变决策，先补：
+
+- retry 复用 logical turn 和 assignment；
+- prefill-only 请求不触发 required-tool JSON 解析；
+- queue time、recompute/prefill time、decode time和 request-level TTFT；
+- decision_source、selected calibration cell、requested/actual output、lifetime/window QPS、active episodes、waiting 和 KV usage。
+
+这些字段是判断 TTL 是否真正减少 recompute，而不只是改变排队顺序的前提。
+
+### 阶段 5：Agent-compatible Dynamic ablation
 
 一次只改变一个变量：
 
-1. 使用历史 completion 预测 output tokens；
-2. lifetime QPS 改为 sliding-window arrival rate 或 queue/KV pressure；
-3. 调整或关闭 512-token bypass；
+1. 用历史真实 completion 预测 output tokens；
+2. lifetime QPS 改为 sliding-window arrival 或 queue/KV pressure；
+3. 调整或关闭 512-token short-append bypass；
 4. 增加真实 Agent context calibration；
-5. 加入工具间隔、next-arrival 和 queue residency 特征。
+5. 加入 next-arrival、工具间隔和 queue residency 特征。
 
-### 阶段 5：集成 TTL
+### 阶段 6：集成 TTL
 
 最终建议比较：
 
@@ -489,14 +629,15 @@ reasoning replay 前的旧 c=36 run 与新 run 不可直接比较，但可用于
 | Static PPD + TTL | 单独验证 TTL |
 | Dynamic + TTL | 最终组合方案 |
 
-所有配置应固定同一模型、Agent commit、SWE-bench episode 集合、temperature、concurrency 和 token 参数。性能 A/B 最好进一步使用已录制的 request/tool-timing replay；live Agent 则保留用于生态真实性验证。
+所有配置固定模型、Agent commit、sample set、temperature、routing mapping、concurrency 和 token 参数。性能主表最好使用录制的 request/tool-timing replay；live Agent 作为生态真实性与 end-to-end 验证。
 
-推荐实际工作流为：
+推荐实际工作流：
 
-    c=2 live editor smoke
-        -> static x=1 concurrency calibration (start at c=16)
-        -> same-version Static/Dynamic at the selected knee
-        -> decision-source and queue-time profiling
+    Agent contract frozen
+        -> deterministic matched routing
+        -> balanced static c=16; c=12 if needed
+        -> original Dynamic at the same point(s)
+        -> request phase / decision profiling
         -> Agent-compatible Dynamic ablations
         -> Static PPD + TTL
         -> Dynamic + TTL
