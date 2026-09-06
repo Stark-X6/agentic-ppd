@@ -1,6 +1,6 @@
 # Agent 修复阶段总结与 PPD/TTL 改动计划
 
-更新时间：2026-09-06
+更新时间：2026-09-07
 
 ## 结论
 
@@ -15,10 +15,78 @@
 当前代码状态：
 
 - uni-agent 分支：fix/agent-tool-contract
-- uni-agent 最新提交：4f25cdf Split editor into strict operation-specific tools
+- uni-agent 最新提交：449f80f4383b Add stable routing identity to agent profiles
 - vllm-ppd 分支：fix/agent-tool-contract
-- vllm-ppd 最新提交：ac30818d0 Use v2 analyzer for run-scoped Agent profiles
+- vllm-ppd 最新提交：ddffde8fcc9b Freeze matched routing and request profiling contracts
+- 两个分支均比 GitHub origin 超前 1 个本地提交，尚未 push
 - 两个代码仓库的 agentic-ppd-baseline-v1 tag 均保持不变
+
+阶段 2（实验路由契约）和阶段 4（请求级 profiling/协议语义）现已实现并通过 CPU contract smoke；尚未重启当前 stack，也尚未做 live 验收。阶段 3 未开始。
+
+## 本次完成：阶段 2 与阶段 4
+
+### 阶段 2：实验路由契约已冻结
+
+现在明确分离了两类 identity：
+
+- `run_id + conversation_id + PPD_PROXY_EPOCH` 只负责当前 stack 中的 turn state 和 cache affinity；
+- `routing_key=instance_id|rollout=N` 只负责跨 Static/Dynamic matched run 的实验分配。
+
+Agent 从 SWE-bench resolved task 的 `metadata.instance_id` 生成 routing key，经 ContextVar 和 `X-PPD-Routing-Key` 传给 proxy。Proxy 默认按数值端口排序节点，并使用带显式 seed 的 SHA-256 对 P、D 等 role 独立选 slot，不再依赖 Python 进程随机 `hash()` 或 ZMQ 注册顺序。`legacy_hash` 仍可显式复现旧的 Python hash + registry insertion order，但不得用于 matched 结果。
+
+前 16 条 SWE-bench Verified 的冻结映射位于：
+
+`/root/vllm-ppd/configs/routing/swebench_verified_first16_balanced_2x2.json`
+
+它已从 `/root/data/swe_agent/swe_bench_verified.parquet` 重新生成并逐字比对，source SHA-256 一致，P 与 D/pD 都是严格 8/8。正式 paired run 必须设置 `PPD_ROUTING_MAP_STRICT=true`；缺 key、缺 role 或 slot 越界会 fail closed。每个 proxy timing row 和 `/status` 都记录 contract version、seed、map fingerprint、候选列表、slot 与 assignment source。
+
+重试协议也被冻结：同一 Agent step 的 transport retry 和 required→auto retry 复用同一个 `client_request_id`，proxy 只在首个物理请求递增 logical turn 并做一次路由/Dynamic 决策；后续物理尝试复用 turn、地址、route、decision features、QPS snapshot 与 calibration cell。统计明确拆成 logical/physical/retry requests。
+
+### 阶段 4：请求级 profiling/协议语义已补齐
+
+P 节点的 prefill-only 请求现在保留与 D 请求相同的 messages 和完整 tool schemas，但固定为 `tool_choice=none`、`max_tokens=1`、`stream=false`。当前 vendored vLLM 保持 `exclude_tools_when_tool_choice_none=false`，因此 prompt/KV 前缀不因工具 schema 被删而改变，同时避免 1-token prefill 结果进入 required-tool 严格 JSON 解析。
+
+非流式 vLLM response 新增 `ppd_request_metrics` schema v1：
+
+- first queued→first scheduled 的 queue time；
+- first scheduled→first token 的 prefill elapsed；
+- first token→last token 的 decode elapsed；
+- inference elapsed、request TTFT 和 TTFT residual；
+- request-level scheduler preemptions；
+- prompt/cached/uncached/completion/requested-max tokens。
+
+`prefill_elapsed` 是包含 prompt 计算/重算、stall 和 preemption 的阶段墙钟，不冒充纯 GPU kernel time。`uncached=prompt-cached` 还包含合法的新 append，因此 analyzer 另用相邻 Agent step 计算 `previous_reusable_tokens`、`lost_reusable_tokens` 和 `cache_retention`；retry 的 warm cache 不参与 retention 证据。
+
+Proxy schema v4 对每个物理请求记录 P、D 两次 HTTP 边界、两侧 engine metrics、ORCA response waiting/KV、requested/actual output、routing/decision metadata、精确定义的 lifetime decision QPS 和仅观测用 1/5/10/60 秒 window QPS。失败请求也保留同一完整字段集。
+
+Analyzer 会在 run 目录生成：
+
+- `request_profile.jsonl`：无损完整字段；
+- `request_profile.csv`：稳定分析列；
+- `analysis.txt`：per-physical-request phase 表和 run-wide p50/p90/max。
+
+每行分别 join P 与 D/pD 的 enter/max/exit running、waiting、KV、GPU 和 preemption counter delta；同时区分 proxy 当时真正 overlap 的其他 LLM 请求，与整个 Agent 生命周期仍活跃、但可能正在跑工具的同节点 episodes。
+
+Dynamic 算法结果未改。新增 `decision_source`、requested/selected QPS、`selected_calibration_cell` 和 calibration availability。策略输入仍严格保持原实现的 `prior logical requests / max(proxy uptime, 1s)`；窗口 QPS 只记录、不参与决策，retry 不计入 logical QPS。
+
+完整字段和边界定义见：
+
+`/root/vllm-ppd/docs/agent_serving_contract.md`
+
+### CPU 验收
+
+本轮没有启动或重启 GPU stack。已完成：
+
+- 全部改动和测试文件 `py_compile`；
+- 4 个 shell 脚本 `bash -n`；
+- 两仓库 `git diff --check`；
+- Quart 模拟 P+D 请求与 required→auto retry，验证同 turn/同节点、P 请求 contract、logical/physical 统计和阶段字段；
+- vLLM response model/phase calculation 真实导入 smoke；
+- Agent routing ContextVar/header/response metric 回传 smoke；
+- frozen map 从原 parquet 重建并逐字一致（16 条，8/8）；
+- 用旧 Dynamic c=2 run 的临时副本验证 analyzer 向后兼容，18 个物理请求成功生成 18 行 JSONL 和 18 行数据 CSV。
+
+基础 Python 环境没有安装 pytest，因此未运行 pytest runner；等价核心断言已由独立 CPU harness 执行。下一次 stack 重启后，必须先检查 `/status` 的 map fingerprint/strict/assignment count，再做 c=2 live smoke，之后才能进入阶段 3。
 
 ## 一、Agent 侧已经完成的修改
 
@@ -152,7 +220,7 @@ editor 拆分后的 Static c=2 live smoke 位于：
 - 语义错误工具调用仍需要模型或 Agent policy 改进。
 - Modal 抖动只能拆分和统计，无法由 Agent 代码彻底消除。
 
-这些技术债不阻塞 serving profiling。后续若没有发现新的 trace 契约错误，不再改变 Agent commit；所有 Static、Dynamic 和 TTL 对照都固定使用当前 Agent 版本。
+这些技术债不阻塞 serving profiling。后续若没有发现新的 trace 契约错误，不再改变 Agent 行为；所有 Static、Dynamic 和 TTL 对照固定使用 uni-agent `449f80f4383b` 及当前 YAML。该提交只增加 stable routing identity 和服务器指标透传，不改变 ReAct policy/tool 行为。
 
 ## 三、PPD 侧已经完成的修复
 
@@ -572,18 +640,13 @@ TTL policy 可以改变“内存紧张时保留谁”，所以当前 loss 形态
 
 ### 阶段 1：冻结 Agent contract（已完成）
 
-CPU contract smoke、c=2 live smoke 和正式 c=16 均已通过。固定 uni-agent `4f25cdf` 及当前 YAML，不再把 Agent 改动混入 serving A/B。
+Agent 行为的 CPU contract smoke、c=2 live smoke 和正式 c=16 均已通过。后续 serving A/B 固定 uni-agent `449f80f4383b` 及当前 YAML；该新增提交只携带 matched-routing identity 与服务端指标透传。
 
-### 阶段 2：修复并冻结实验路由契约
+### 阶段 2：修复并冻结实验路由契约（代码完成，待 live 验收）
 
-在不改变 PPD/Dynamic 决策的前提下：
+实现已落在 vllm-ppd `ddffde8fcc9b` 和 uni-agent `449f80f4383b`：state/routing key 已分离，默认 stable SHA-256 + sorted address + explicit seed，前 16 条 8/8 frozen map 已 checked in，mapping metadata 与 strict fail-closed 已补齐。`legacy_hash` 仅用于旧行为诊断；当前 c=16 run 仍保留为 pre-fix routing-skew stress baseline。
 
-1. 分离 state key 与 deterministic routing key；
-2. 排序 server 地址，使用稳定 `hashlib` 和显式 routing seed；
-3. 记录完整 mapping 元数据；
-4. 预先冻结前 16 条在两台 decode 上的 assignment，并让 paired configs 共用。
-
-原始 hash 行为保留开关，当前 c=16 run 保留为 pre-fix stress baseline。若坚持完全不改 proxy，则至少每个配置跑多个 hash seed，不能拿单次 11/5 与另一单次随机分配比较。
+进入阶段 3 前只需重启后做一次 c=2 live contract smoke，并确认 `/status.routing_contract` 的 path、fingerprint、`map_assignment_count=16` 和 `map_strict=true`。
 
 ### 阶段 3：确定 balanced knee/stress，并跑 matched Dynamic
 
@@ -595,16 +658,11 @@ CPU contract smoke、c=2 live smoke 和正式 c=16 均已通过。固定 uni-age
 
 原始 Dynamic 预计仍 100% 选择 PPD；这轮的目的，是在严格控制 routing 和 Agent contract 后验证它是否等价退化为 `x=1`，并量化 Dynamic decision overhead，而不是期待它自动解决 eviction。
 
-### 阶段 4：补齐 PPD 请求级 profiling/协议语义
+### 阶段 4：补齐 PPD 请求级 profiling/协议语义（代码完成，待 live 验收）
 
-不改变决策，先补：
+以上字段已在 vllm-ppd `ddffde8fcc9b` 实现：logical retry、prefill-only parse contract、P/D request phases、request TTFT/preemption/tokens、decision source/cell、requested/actual output、lifetime/window QPS、两类 active concurrency 以及 P/D waiting/KV 均进入 schema 化 artifact。
 
-- retry 复用 logical turn 和 assignment；
-- prefill-only 请求不触发 required-tool JSON 解析；
-- queue time、recompute/prefill time、decode time和 request-level TTFT；
-- decision_source、selected calibration cell、requested/actual output、lifetime/window QPS、active episodes、waiting 和 KV usage。
-
-这些字段是判断 TTL 是否真正减少 recompute，而不只是改变排队顺序的前提。
+这里能测得的是 request-level phase elapsed 和 lost reusable tokens，不把它们误称为纯 kernel recompute time。下一次 live smoke 要确认新 vLLM response 确实含 `ppd_request_metrics`，且 `request_profile.jsonl` 的 P/D engine/load 字段非空；通过后阶段 4 即正式冻结。
 
 ### 阶段 5：Agent-compatible Dynamic ablation
 
