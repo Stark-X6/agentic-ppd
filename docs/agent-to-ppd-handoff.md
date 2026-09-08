@@ -1,14 +1,16 @@
 # Agent 修复阶段总结与 PPD/TTL 改动计划
 
-更新时间：2026-09-07
+更新时间：2026-09-08
 
 ## 结论
 
-阶段 2（实验路由契约）和阶段 4（请求级 profiling/协议语义）已通过 c=2 与完整 c=16 的真实 GPU 验收。最新 Static `x=1` run 使用 frozen map 将 16 个 episode 严格分为 8/8；370 个逻辑请求、372 个物理 attempt 均保持相同 map fingerprint，16 次 Turn 1 为 `ppd`，354 次 Turn 2+ 为 `ppd_direct`。两次 required-tool 失败均以同一 client request、turn、route 和节点重试成功，没有再污染 turn counter。
+阶段 2（实验路由契约）和阶段 4（请求级 profiling/协议语义）已通过 c=2、c=12 和 c=16 的真实 GPU 验收。两个正式 run 都使用同一 frozen map，将 SWE-bench Verified 前 16 条严格分到两个 pD 节点各8 个 episode；所有 physical row 都保持 fingerprint `0d2f3a9d...459c`，Turn 1/Turn 2+ 分别为 `ppd`/`ppd_direct`，自动重试没有污染 turn、route 或 affinity。
 
-c=16 应正式定义为 stress，而不是 knee：353 个可判断 transition 中 123 个 retention 低于 90%（34.8%），其中 90 个低于 50%，共有 58 次 request-level preemption。尽管 episode 数是 8/8，8200/8201 最终承载 232/138 个逻辑请求和 6.72M/3.56M cumulative prompt tokens；122/123 个 loss 与全部 58 次 preemption 都落在 8200。“身份均衡”已复现，但 live Agent 的轨迹长度仍造成明显的“工作量不均衡”。
+并发拐点现在被夹在 c=12 和 c=16 之间。c=12 的 290 个可判断 transition 中只有 2 个 retention<90%（0.7%，集中在 1 个 episode），没有 retention<50% 或 preemption；queue/prefill/TTFT p90 为 0.014/0.196/0.260 s。c=16 则有 123/353 个 loss（34.8%）、90 个 retention<50% 和 58 次 preemption，同三项 p90 为 8.99/7.65/16.22 s。因此 c=12 是健康侧/下界，c=16 是 stress/上界；按预先约定的 5%～20% loss 且无持续排队标准，c=12 不应被命名为 knee，下一个最有信息量的点是 c=14。
 
-请求阶段数据把瓶颈进一步定位到 queue 与 prefix recompute/prefill。cache-loss 请求的 queue/prefill/TTFT/LLM p50 为 6.04/3.62/12.25/36.76 s，retained 请求为约 0/0.134/0.176/15.31 s；前序工具时间反而是 1.39/1.44 s。当前 loss 与 KV 满载、waiting、排队和 preemption 共现，不是长工具调用导致。下一步应保持 16 个 sample 和同一 mapping，只把并发降到 12，寻找 knee 后再跑 matched Dynamic。
+c=12 的两个低 retention 事件与 c=16 的压力型事件不同：它们的工具窗口 KV 仅 35.3%～61.6%，waiting=0、preemption=0，下一请求 KV 最高仅 74.4%。当前只能称为 cache-loss candidates，可能是稀疏驱逐，也可能是 reasoning/tool-call 结构化后重渲染导致的 token-prefix 不连续；TTL 只能改善前者。c=16 中 KV≈100%、waiting、queue、prefill 和 preemption 的强共现，才是目前更坚实的容量驱逐证据。
+
+虽然身份一直是 8/8，live Agent 轨迹并不可重放：c=12 的两节点承载 162/145 个逻辑请求和 4.67M/3.75M prompt tokens，c=16 则是 232/138 和 6.75M/3.56M；同一 sample 的 step 数差最大达 45。temperature=0 降低了采样随机性，但 GPU batching、浮点差异、工具输出与后续行为分叉仍会改变实际 workload。因而 c=12/c=16 可用来定标压力区间，不能当成严格 paired performance A/B。
 
 当前代码状态：
 
@@ -20,7 +22,7 @@ c=16 应正式定义为 stress，而不是 knee：353 个可判断 transition �
 - uni-agent 比 GitHub origin 超前 1 个本地提交，vllm-ppd 超前 2 个，均尚未 push
 - 两个代码仓库的 agentic-ppd-baseline-v1 tag 均保持不变
 
-阶段 3 已完成 c=2 gate 和 deterministic 8/8 Static c=16 stress；尚未执行的是 16 episodes、concurrency=12 的 Static knee 定标及随后 matched Dynamic。
+阶段 3 已完成 c=2 gate、deterministic 8/8 Static c=16 stress 和 Static c=12 健康侧定标。下一步只改 global concurrency 为 14，确定 knee 后再跑同并发、同 mapping 的原始 Dynamic。
 
 ## 本次完成：阶段 2 与阶段 4
 
@@ -344,9 +346,9 @@ append 使用与模型一致的 tokenizer 和 chat template 计数，解决了 A
 - 用 strict 模式对缺 key、缺 role 和 slot 越界 fail closed；
 - 在每个 timing row 与 `/status` 中记录 fingerprint、slot、assignment source 和候选节点。
 
-c=2 live smoke 验证了 frozen-map slot 与后续 conversation affinity；完整 c=16 又验证了 16/16 首轮、354/354 后续 affinity 和 372/372 个 physical rows 的 fingerprint。两次自动 retry 也都复用原 turn、route 和节点。后续 Static/Dynamic 必须继续使用同一 mapping 和 fingerprint。
+c=2 live smoke 验证了 frozen-map slot 与后续 conversation affinity；完整 c=16 又验证了 16/16 首轮、354/354 后续 affinity 和 372/372 个 physical rows 的 fingerprint。c=12 进一步验证了 16/16 首轮、291/291 后续 affinity 和 308/308 个 physical rows 的 fingerprint。三次自动 retry 都复用原 turn、route 和节点。后续 Static/Dynamic 必须继续使用同一 mapping 和 fingerprint。
 
-最新结果同时验证了限制：8/8 只冻结 episode 数量和身份，不保证两个节点最终 request 数、token 数或 wall time 相等。c=16 的 8200/8201 分别收到 232/138 个逻辑请求和 6.72M/3.56M prompt tokens。因此 matched 报告必须继续列每节点 episodes、requests、prompt/completion tokens、KV、waiting 和 preemption，不能只写“8/8 balanced”。
+最新结果同时验证了限制：8/8 只冻结 episode 数量和身份，不保证两个节点最终 request 数、token 数或 wall time 相等。c=16 的 8200/8201 分别收到 232/138 个逻辑请求和 6.75M/3.56M prompt tokens，c=12 则是 162/145 和 4.67M/3.75M。因此 matched 报告必须继续列每节点 episodes、requests、prompt/completion tokens、KV、waiting 和 preemption，不能只写“8/8 balanced”。
 
 QPS 6～20 仍无 clean calibration；不过现有 Agent run 的 lifetime QPS 均映射到 0.5 档，所以它不影响当前原始 Dynamic 路径是否可执行。它仍限制更高流量场景的结论外推。
 
@@ -401,7 +403,7 @@ QPS 6～20 仍无 clean calibration；不过现有 Agent run 的 lifetime QPS �
 
 ### P2：缺少 TTL-aware cache policy
 
-当前 PPD cache loss 后主要是 KV 被驱逐、下一轮重新计算，没有明确的 KV offload 层，也没有根据 Agent 预计返回时间进行 TTL-aware eviction。
+c=16 中与 KV≈100%、waiting、queue 和 preemption 共现的 loss 主要表现为下一轮重新计算；当前没有明确的 KV offload 层，也没有根据 Agent 预计返回时间进行 TTL-aware eviction。但 cached-token retention 只观测“前缀没有命中”，不能单独证明“容量驱逐”；c=12 的两个低压 loss candidate 还可能来自 reasoning/tool-call 重渲染后的 token-prefix 不连续。
 
 将 Continuum 集成进来至少需要：
 
@@ -710,7 +712,7 @@ TTL policy 可以改变“内存紧张时保留谁”，所以当前 loss 形态
 
 | pD | episodes | logical requests | prompt-token sum | completion sum | known/loss | retention<50% | KV max p50/p90 | waiting>0 | preemptions |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 8200 | 8 | 232 | 6,715,216 | 227,315 | 223 / 122（54.7%） | 90 | 95.1% / 99.95% | 156/232 | 58 |
+| 8200 | 8 | 232 | 6,749,585 | 227,315 | 223 / 122（54.7%） | 90 | 95.1% / 99.95% | 156/232 | 58 |
 | 8201 | 8 | 138 | 3,559,030 | 167,696 | 130 / 1（0.8%） | 0 | 77.2% / 93.7% | 12/138 | 0 |
 
 全局 353 个可判断 transition 中有 123 个 retention<90%（34.8%），90 个低于 50%，涉及 8/16 个 episode；event-level lost reusable tokens 合计 2,686,318。该总和会重复计算同一前缀的多次丢失，只代表跨 transition 的重算暴露量，不是唯一 KV 容量。
@@ -758,9 +760,93 @@ Agent 语义污染仍很明显：262 次 `replace_text` 中至少 257 次 observ
 - cache loss 的附加延迟主要落在 queue、prefill/recompute 和 TTFT，而非前序 tool time；
 - c=16 适合后续 Static PPD+TTL 压力对照，但不应作为唯一 knee。
 
-下一步保持 sample 总数为 16、mapping 和所有模型参数不变，仅把 global concurrency 降为 12；不要把 `--limit` 改成 12，否则 sample set 会变化。若 c=12 的全局 loss 落到约 5%～20%且不再持续 queue/preempt，就将它冻结为 knee，并在同一配置下运行原始 Dynamic。若 c=12 仍明显过载，再测 c=8～10。c=16 的 matched Dynamic 可作为额外 stress 对照，但优先级低于确定 knee。
+c=12 定标已按上述契约完成：它落在健康侧而非 5%～20% loss 的 knee 区间。详细结果见下一节；后续保持 `--limit 16` 和同一 sample set，只将 global concurrency 设为 14。
 
-## 八、建议的后续顺序
+## 八、2026-09-08 frozen-map Static x=1、16 episodes、c=12 结果
+
+### 1. 配置与数据完整性
+
+正式 run：
+
+`/root/vllm-ppd/logs/runs/stage3_knee_static_c12_20260908T055104Z`
+
+它与 c=16 stress 使用同一模型、BF16、2P_2pD、Static `x=1`、155648 context、131072 episode completion budget、16384 per-turn max output、temperature=0、SWE-bench Verified 前 16 条和 strict frozen map；唯一实验参数变化是 workers/global concurrency 从 16 降为 12。`--limit` 仍为 16，因此是“共 16 个 episode，最多同时 12 个”：首批启动 12 个，前面有 episode 完成后再补入剩余 4 个。frozen map 使首批在每个 pD 上最多各 6 个 active episode。
+
+| 项目 | 结果 |
+|---|---:|
+| traces | 16/16 |
+| Agent wall / manifest wall | 1248.5 / 1258.0 s（约 20 分 58 秒） |
+| termination | 14 finished / 2 max_steps |
+| resolved / WA / timeout | 1 / 15 / 0 |
+| logical requests / physical attempts | 307 / 308 |
+| logical routes | 16 `ppd` / 291 `ppd_direct` |
+| retry | 1，成功恢复 |
+| routing fingerprint | 308/308 一致 |
+| frozen assignment | 8200 与 8201 各8 episodes |
+
+16/16 个 Turn 1 都有 P 侧 engine/load 指标。308/308 个 physical attempts 都精确 join 到 episode/request 与 load window；307 个成功 response 都有 D 侧 engine metrics、TTFT 和 Agent `ppd_request_metrics`。唯一失败 attempt 没有 response metrics，符合当前协议。`aggregate_summary.json` 和五个 `server_logs/` 原始日志已归档到该 run 目录。
+
+唯一重试是 `astropy__astropy-14182` 的 step 34：required-tool 输出被截断，249.26 s 后由 vLLM 严格 JSON parser 返回 HTTP 400，随后 `tool_choice=auto` 在同一 client request、turn、route 和 8200 重试成功。Agent LLM wall 包含这次已消耗但失败的生成，而 server phase 分位数无法包含它的 engine breakdown；因此不应把本 run 的整体 wall time 当成纯 serving 吞吐指标。
+
+### 2. c=12 处于健康侧，拐点位于 12 和 16 之间
+
+| 指标 | c=12 | c=16 stress |
+|---|---:|---:|
+| 每 pD 最大 active episodes | 6 | 8 |
+| logical requests | 307 | 370 |
+| KV max p50 / p90 / max | 62.4% / 79.8% / 88.7% | 88.4% / 99.5% / 100.0% |
+| requests with waiting>0 | 51/307 | 168/370 |
+| request-level preemptions | 0 | 58 |
+| retention<90% | 2/290（0.7%） | 123/353（34.8%） |
+| retention<50% | 0 | 90 |
+| queue p90 | 0.014 s | 8.988 s |
+| prefill p90 | 0.196 s | 7.645 s |
+| TTFT p90 | 0.260 s | 16.216 s |
+| decode p90 | 45.819 s | 55.668 s |
+| Agent LLM p90 | 48.535 s | 63.149 s |
+
+c=12 没有持续 scheduler queue/prefill 压力，将并发从每 pD 最多 8 个降到 6 个后，c=16 的驱逐、重算和 preemption 崩塌基本消失。这不是“c=12 已找到 knee”，而是它低于事先定义的 5%～20% cache-loss 目标区间。
+
+| pD | episodes | requests | prompt-token sum | completion sum | known/loss | KV max p50/p90/max | waiting>0 | preemptions |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8200 | 8 | 162 | 4,672,386 | 179,095 | 153 / 2（1.3%） | 62.6% / 74.4% / 83.3% | 27/162 | 0 |
+| 8201 | 8 | 145 | 3,745,675 | 192,577 | 137 / 0（0%） | 62.4% / 82.5% / 88.7% | 24/145 | 0 |
+
+与 c=16 的 232/138 requests 和 6.75M/3.56M prompt tokens 相比，c=12 实际工作量也更均衡。但这是本次 live trajectory 的结果，不是 frozen map 能保证的属性。
+
+### 3. 两个低 retention 事件不能直接解释为容量驱逐
+
+两个 event-level candidate 都来自 8200 上的 `astropy__astropy-14598`：
+
+| transition | previous reusable | next cached | lost | retention | previous tools | tool-gap KV | next-request KV max / waiting | queue / prefill / TTFT | LLM |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1→2 | 8732 | 4672 | 4060 | 53.5% | 5.207 s（2 calls） | 35.3%～54.4% | 60.6% / 0 | ~0 / 0.366 / 0.385 s | 9.279 s |
+| 3→4 | 17457 | 15376 | 2081 | 88.1% | 1.422 s | 61.5%～61.6% | 74.4% / 1 | ~0 / 0.321 / 0.343 s | 76.127 s |
+
+两个工具窗口的 running 最高分别为 3/4，waiting 始终为 0，preemption counter 没有变化。第二个请求的 76.1 s 几乎全是 3675-token generation 的 decode（75.7 s），不是 queue 或 prefill 卡顿。二者 event-level lost reusable tokens 合计 6141，但该和只是重算暴露量，不是唯一驱逐 KV 容量。
+
+这两点不具备 c=16 的“KV≈100% + waiting + queue + preemption”容量特征。它们可能是短暂的 cache eviction，也可能是 vLLM 把原始生成解析成 reasoning/tool calls 后，Agent 再将结构化 assistant message 渲染回 prompt 时产生了 token-prefix 分叉。现有 `cached_tokens` 只告诉我们“未命中多少”，不告诉“为什么未命中”。TTL 不会修复 token-prefix 不连续；在 TTL 效果归因前，应增加 raw generated token IDs/下轮 prompt token IDs 的 LCP，或直接记录 block eviction/offload/restore 事件。
+
+### 4. 当前主要时间仍在 generation，不在 Tool/Modal
+
+- 307/307 response 都有非空 reasoning 和 tool call，291/291 个后续请求回放 reasoning；assistant `content` 为空是该 thinking 模型的结构化输出，不代表没开 thinking。
+- prompt tokens p50/p90/max 为 27546/44200/52802；completion tokens 为 707/2093/12006，而 requested max 始终为 16384。c=12 的 queue/prefill/TTFT 已很低，LLM 长尾主要由长 thinking/generation 和一次截断重试形成。
+- 320 次工具 handler 全部返回 `ok`，工具耗时 p50/p90/max 为 1.461/2.420/7.561 s；toolbox setup 为 10.936/11.620/14.084 s。episode 时间累加中 LLM/tool/setup 约占 91.6%/6.2%/2.1%。
+- Agent 语义问题仍在：230 次 `replace_text` 中至少 223 次 observation 为 `No replacement was performed`，另有 8 次无效路径；14 个 episode 调用 submit，最终只有 1/16 resolved。这是质量/轨迹污染，不是 Tool CPU 瓶颈。
+
+### 5. 可复现性限制与下一步
+
+尽管数据、模型、temperature=0、Agent commit、schema 和 routing identity 相同，c=12/c=16 的同 sample 轨迹仍显著分叉：例如 `astropy-14365` 为 5/50 steps，`astropy-14182` 为 50/18 steps，16 个 sample 中最大 step 差为 45；总 logical requests 为 307/370。这使 wall time、总 token 和节点工作量不是只由 concurrency 决定。live Agent 适合定标系统会遇到的压力与驱逐形态；严格的 serving-policy paired A/B 仍应用录制后的 request/tool-timing replay 补齐。
+
+下一轮保持 total episodes=16、前 16 条、同一 frozen map 和全部模型/Agent 参数，只设 global concurrency=14。这会使首批每个 pD 最多各 7 个 active episode，正好位于 c=12 的 6/节点与 c=16 的 8/节点之间：
+
+- 若 loss 约 5%～20%，且没有持续 queue/preemption，将 c=14 冻结为 knee；
+- 若 loss<5%，说明性能崩塌主要发生在 14→16；c=14 可作健康上界，只有需要更精确 knee 时才补 c=15；
+- 若 loss>20% 或出现持续 preemption，c=14 也属 stress，只有需要更精确时才补 c=13。
+
+在 c=14 分类完成前不跑 Dynamic。knee 确定后，用完全相同的 sample、mapping、concurrency 和 token 参数运行原始 Dynamic 2P_2D；c=16 Dynamic 仍只是可选 stress pair。
+
+## 九、建议的后续顺序
 
 ### 阶段 1：冻结 Agent contract（已完成）
 
@@ -772,12 +858,13 @@ Agent 行为的 CPU contract smoke、c=2 live smoke 和正式 c=16 均已通过�
 
 ### 阶段 3：确定 knee/stress，并跑 matched Dynamic（进行中）
 
-c=2 contract gate 和 deterministic 8/8 Static c=16 已完成。c=16 的 global loss=34.8%、8200 loss=54.7%，并伴随 58 次 preemption、queue p90=9.0 s 和 TTFT p90=16.2 s，已冻结为 stress。
+c=2 contract gate、deterministic 8/8 Static c=16 stress 和 Static c=12 健康侧已完成。c=12/c=16 的 global loss 为 0.7%/34.8%，preemption 为 0/58，queue p90 为 0.014/8.988 s，TTFT p90 为 0.260/16.216 s，因此 knee 位于两者之间。
 
-下一轮保持前 16 条和同一 map，设置 total episodes=16、global concurrency=12：
+下一轮保持前 16 条、total episodes=16 和同一 map，仅设 global concurrency=14：
 
 - 若 loss 约 5%～20%且没有持续 waiting/preemption，定义为 knee；
-- 若仍高于 20%并持续排队，再测 concurrency=8～10；
+- 若 loss<5%，c=14 作为健康上界，必要时才补 c=15；
+- 若 loss>20% 或持续 preemption，c=14 也属 stress，必要时才补 c=13；
 - knee 确定后，用完全相同 sample、mapping、concurrency 和参数跑原始 Dynamic 2P_2D；
 - c=16 Dynamic 只作为可选 stress pair，不替代 knee pair。
 
@@ -787,7 +874,7 @@ c=2 contract gate 和 deterministic 8/8 Static c=16 已完成。c=16 的 global 
 
 以上字段已在 vllm-ppd `ddffde8fcc9b` 实现：logical retry、prefill-only parse contract、P/D request phases、request TTFT/preemption/tokens、decision source/cell、requested/actual output、lifetime/window QPS、两类 active concurrency以及 P/D waiting/KV 均进入 schema 化 artifact。
 
-c=2 与 c=16 live run 已确认成功 response 的 P/D engine/ORCA/load fields、非流式 TTFT 和等量 request-profile rows。c=16 还真实覆盖了两次 required→auto retry：同一 logical request 复用 turn、route 和节点，logical/physical 统计为 370/372。这里测得的是 request-level phase elapsed 和 lost reusable tokens，不把它们误称为纯 kernel recompute time。尚未覆盖的只剩 Dynamic 特有的 decision source/cell 组合；它将在 matched Dynamic run 中验收。
+c=2、c=12 与 c=16 live run 已确认成功 response 的 P/D engine/ORCA/load fields、非流式 TTFT 和等量 request-profile rows。c=12/c=16 还真实覆盖了一次/两次 required→auto retry：同一 logical request 复用 turn、route 和节点，logical/physical 统计分别为 307/308 和 370/372。这里测得的是 request-level phase elapsed 和 lost reusable tokens，不把它们误称为纯 kernel recompute time，也不把低 retention 单独视为 eviction 证明。尚未覆盖的只剩 Dynamic 特有的 decision source/cell 组合；它将在 matched Dynamic run 中验收。
 
 ### 阶段 5：Agent-compatible Dynamic ablation
 
@@ -818,7 +905,7 @@ c=2 与 c=16 live run 已确认成功 response 的 P/D engine/ORCA/load fields�
 
     Agent contract frozen
         -> deterministic matched routing
-        -> balanced static c=16; c=12 if needed
+        -> static c=12 healthy bound; c=16 stress bound; c=14 knee probe
         -> original Dynamic at the same point(s)
         -> request phase / decision profiling
         -> Agent-compatible Dynamic ablations
