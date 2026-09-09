@@ -2,11 +2,109 @@
 
 更新时间：2026-09-09
 
-本文集中保存 Agent 场景下 PPD serving 的 live profiling 实验结果。内容从 `agent-to-ppd-handoff.md` 的原第五至第十章拆出，实验数据、结论、限制和原章节编号均原样保留，便于继续按时间顺序追加实验。代码契约、当前问题和后续计划仍以 [Agent 修复阶段总结与 PPD/TTL 改动计划](./agent-to-ppd-handoff.md) 为准。
+本文按实验阶段和日期集中保存 Agent 场景下 PPD serving 的 CPU contract、live smoke、正式 profiling、结果解释和可复现性限制。这里记录“跑了什么、得到什么数据、能与不能推出什么”；当前代码契约、未解决问题和后续计划以 [Agent 修复阶段总结与 PPD/TTL 改动计划](./agent-to-ppd-handoff.md) 为准。
 
-当前收录六轮正式实验：corrected Dynamic c=36、strict-editor Static c=16、frozen-map Static c=16、frozen-map Static c=12、frozen-map Static c=14 knee，以及 frozen-map 原始 Dynamic c=14。
+当前章节重新编号如下：第一章是契约/小规模验收，第二至第七章依次记录 corrected Dynamic c=36、strict-editor Static c=16、frozen-map Static c=16、Static c=12、Static c=14 knee 和原始 Dynamic c=14。后续实验继续按时间追加新章节，不沿用 handoff 的历史章节号。
 
-## 五、2026-09-06 corrected Dynamic 实验结果
+## 一、契约修复与小规模验收
+
+本章集中记录正式压力实验之前的 Agent、routing、profiling 和 loader 验收。这些 run 用于验证数据与协议契约，不用于比较模型能力、Dynamic 收益或 TTL 收益。
+
+### 1. 2026-09-06 corrected Dynamic c=2 smoke
+
+正式产物：
+
+`/root/vllm-ppd/logs/runs/dynamic_smoke_corrected_flat_c2_20260906T044159Z`
+
+该 smoke 验证了 Turn 1 `pd`、Turn 2+ `ppd_dynamic`、精确 append tokenizer、reasoning replay 和 Agent/proxy/metrics 三源 join。2/2 episodes 自然结束，没有 timeout。它只证明 corrected Dynamic 请求链路可运行，不用于判断 cache pressure 或 serving speedup。
+
+### 2. 2026-09-06 editor-split Static c=2 smoke
+
+正式产物：
+
+`/root/vllm-ppd/logs/runs/static_x1_editor_split_smoke_c2_20260906T073603Z`
+
+验证结果：
+
+- 2/2 episodes 正常结束；
+- 33/33 工具 handler 正常返回，无 `format_error`；
+- 31/31 相邻 transition 的 reasoning 精确回放；
+- 路由为 2 次 Turn 1 `ppd` 和 31 次 Turn 2+ `ppd_direct`；
+- 小规模下没有 cache loss。
+
+这证明五工具 schema 能被模型和真实 Modal 数据面接受，但 `status=ok` 仅代表 handler/RPC 正常，不保证编辑实际命中或任务解法正确。正式 c=16 的 322 次工具调用覆盖记录见第三章。
+
+### 3. 2026-09-07 阶段 2/4 CPU contract 与 loader 验收
+
+实现阶段没有启动或重启 GPU stack，完成了：
+
+- 全部改动和测试文件 `py_compile`；
+- 4 个 shell 脚本 `bash -n`；
+- 两仓库 `git diff --check`；
+- Quart 模拟 P+D 请求与 required→auto retry，验证同 turn/同节点、P 请求 contract、logical/physical 统计和阶段字段；
+- vLLM response model/phase calculation 真实导入 smoke；
+- Agent routing ContextVar/header/response metric 回传 smoke；
+- frozen map 从原 parquet 重建并逐字一致（16 条，8/8）；
+- 用旧 Dynamic c=2 run 的临时副本验证 analyzer 向后兼容，18 个 physical attempts 生成 18 行 JSONL 和 18 行数据 CSV。
+
+Editor CPU contract 另外覆盖：五个 schema 的 required 集合、缺少 `insert_text.new_str` 时禁止 sandbox I/O、view/create、replace/insert、跨 wrapper 两次 undo 和修正后的插入行号语义。
+
+Calibration loader 的真实目录回归结果为：修复前只加载 18/72 matched pairs，修复后加载 72/72，完整 lookup table 为 180 entries；4 个 loader 回归测试通过。
+
+基础 Python 环境当时没有安装 pytest，因此通用 pytest runner 未执行；上述核心断言由独立 CPU harness 完成，随后再进行真实 GPU contract gate。
+
+### 4. 2026-09-07 frozen-map Static c=2 contract smoke
+
+正式产物位于：
+
+`/root/vllm-ppd/logs/runs/stage3_contract_static_c2_20260907T0255Z`
+
+实验参数为 Qwen3-30B-A3B-Thinking-2507、BF16、2P_2pD、Static `x=1`、前 2 条 SWE-bench Verified、2 workers、concurrency=2、temperature=0、155648 context、131072 episode completion budget 和 16384 per-turn max output。workload exit code 为 0，2/2 episode 都以 `finished` 结束，无 timeout/error；Agent driver wall 为 457.1 s，包含 wrapper 收尾的 manifest wall 为 465.6 s。两个样本均为 WA，因此该 run 只验收 serving/trace contract，不作为能力结果。
+
+路由和请求完整性：
+
+| 项目 | 结果 |
+|---|---:|
+| logical / physical requests | 30 / 30 |
+| retry | 0 |
+| HTTP 200 | 30/30 |
+| Turn 1 | 2 次 `ppd` |
+| Turn 2+ | 28 次 `ppd_direct` |
+| frozen-map 首轮分配 | 8100→8200 与 8101→8201，各 1 episode |
+| 后续 conversation affinity | 28/28 命中原 pD |
+| map fingerprint | `0d2f3a9d50231b114bd1f963ccf0f1264b673c224804af1cbac154d8eaef459c` |
+
+两条 Turn 1 都使用 `same_prompt_tool_choice_none_max_tokens_1_v1`，P 和 D 均返回 200。首轮 D 侧 cached 分别为 2210/2211 和 2597/2598；这是 P→pD 外部 KV transfer 的结果，不是预热命中。Turn 2+ 则全部在固定 pD 上做本地 prefix-cache 命中，没有误路由到另一个节点。
+
+请求级数据契约覆盖率：
+
+| 字段族 | 覆盖 |
+|---|---:|
+| schema v4 + exact episode/request join | 30/30 |
+| D engine phases/tokens/preemption | 30/30 |
+| D ORCA response load + metrics window | 30/30 |
+| P engine/ORCA/metrics window（Turn 1） | 2/2 |
+| Agent step `ppd_request_metrics` | 30/30 |
+
+这说明阶段 4 的核心字段不再只是 CPU mock：非流式请求也能获得真实 engine TTFT。D 侧 queue/prefill/decode/TTFT/HTTP 的 p50 分别为 0.000016/0.116/8.83/0.147/9.07 s，p90 分别为 0.0023/0.153/29.48/0.232/29.68 s。没有 request-level preemption，request window 的 decode waiting max 为 1，KV usage max 为 27.0%。
+
+28 个可判断的相邻 transition 中，retention min/p50/p90/max 为 97.09%/99.53%/99.74%/99.80%，没有低于 90% 的 cache-loss event。`lost_reusable_tokens` 的 33～751 token 小缺口在这种低 KV/低 queue 条件下不能直接叫 eviction；它还包含 block 对齐和从 Agent transcript 重建 reusable prefix 的估计误差。这个 c=2 结果仅证明 contract 正常，不能用于评估 TTL 收益。
+
+Thinking 和 output 语义也得到验证：30/30 response 都有非空 reasoning 和 tool calls，assistant `content` 为空是该 thinking 模型的正常表示；28/28 个后续请求标记 reasoning replay，且 last role 都是 `tool`。真实 completion tokens 的 p50/p90/max 为 888/3150/7950，明显小于 30/30 请求都使用的 16384 上限，再次证明原始 Dynamic 把 `max_tokens` 当 output feature 会系统性高估生成长度。
+
+工具层共 31 次调用。RPC/handler 层全部返回 `status=ok`，工具时长最高 6.33 s；但 observation 语义上有 24 次 `replace_text` 返回 `No replacement was performed`，另有 1 次错误路径。第二个 episode 因此在同一编辑动作上循环并最终提交错误答案。这里必须区分：
+
+- `status=ok` 当前只表示工具 handler/RPC 正常返回；
+- 它不表示文件修改成功或任务解法正确；
+- schema split 已消除缺必需参数的 `format_error`，但无法阻止模型生成不存在的 `old_str` 或反复执行相同失败动作。
+
+这不是 PPD serving 故障，也不妨碍本次 contract gate；不过 analyzer 以后应单列 `semantic_outcome`/`mutation_applied`，避免把 handler success 写成“工具调用成功”。若要保持当前 serving baseline 不变，可先在派生分析中标注，不改变 ReAct loop 行为。
+
+Modal 分解还捕获到两个 episode 的 toolbox setup 分别为 41.54 s 和 11.96 s。较慢者主要是一次 `exec:tmux` 25.14 s，其中 submit 约 23.99 s；这属于 sandbox/RPC 初始化长尾，已与 episode 内工具执行、LLM 时间分开，不应归因给 grep、editor 或 LLM server。
+
+Analyzer 在验收时修正了两个展示问题并重新生成本 run 的 `analysis.txt`/`request_profile.*`：小样本 p90 改为线性插值；TTFT warning 改为识别新的 `decode_engine_ttft_s`。对应提交为 vllm-ppd `11dccb5d6`。
+
+## 二、2026-09-06 corrected Dynamic、c=36
 
 ### 1. 实验与数据完整性
 
@@ -154,9 +252,9 @@ corrected Dynamic c=36 中 retention<90% 已达 68.5%，两个 decode 节点 act
 
 当时根据 reasoning replay 前后 prompt p50 从 10309 增至 24684，曾用 `36 × 10309 / 24684 ≈ 15.0` 粗略选择 c=16 作为首个校准点。这个选择已完成实测，但新结果表明“总并发 × 全局中位上下文”不足以定 knee：conversation affinity 将 c=16 分成局部 11/5，使一台节点严重 loss、另一台几乎无 loss。
 
-因此旧的 5%/20% loss 选点阈值仍可作为工程准则，但必须在 deterministic、最好平衡的 sample→node mapping 下应用。当前 c=16 的结论和新的实验顺序见下一节及第七节。
+因此旧的 5%/20% loss 选点阈值仍可作为工程准则，但必须在 deterministic、最好平衡的 sample→node mapping 下应用。当前 c=16 的结论和后续定标过程见第三章与第四章。
 
-## 六、2026-09-06 strict-editor Static x=1、matched16 c=16 结果
+## 三、2026-09-06 strict-editor Static x=1、matched16 c=16
 
 ### 1. 实验配置与完整性
 
@@ -275,7 +373,7 @@ TTL policy 可以改变“内存紧张时保留谁”，所以当前 loss 形态
 - loss 后多出的约 49 s median 全是 KV recompute；
 - TTL 单独即可消除 loss，或 0/16 score 是 serving 算法导致。
 
-## 七、2026-09-07 frozen-map Static x=1、16 episodes、c=16 结果
+## 四、2026-09-07 frozen-map Static x=1、16 episodes、c=16
 
 ### 1. 配置与完整性
 
@@ -355,7 +453,7 @@ Agent 语义污染仍很明显：262 次 `replace_text` 中至少 257 次 observ
 
 c=12 定标已按上述契约完成：它落在健康侧而非 5%～20% loss 的 knee 区间。c=14 随后满足预设 knee 条件并已冻结；详细结果见后两节。
 
-## 八、2026-09-08 frozen-map Static x=1、16 episodes、c=12 结果
+## 五、2026-09-08 frozen-map Static x=1、16 episodes、c=12
 
 ### 1. 配置与数据完整性
 
@@ -433,7 +531,7 @@ c=12 没有持续 scheduler queue/prefill 压力，将并发从每 pD 最多 8 �
 
 c=14 已完成：15/264（5.7%）known transitions 发生 retention<90%，没有持续 queue/preemption，满足预设 knee 标准。c=12/c=14/c=16 现在分别冻结为 healthy/knee/stress 三个点；下一轮无需继续二分并发，直接在 c=14 运行原始 Dynamic 2P_2D。
 
-## 九、2026-09-08 frozen-map Static x=1、16 episodes、c=14 knee 结果
+## 六、2026-09-08 frozen-map Static x=1、16 episodes、c=14 knee
 
 ### 1. 配置与数据完整性
 
@@ -527,7 +625,7 @@ c=14 已达到这轮实验的定标目标：它同时提供大量 retained 请�
 
 原始 Dynamic c=14 已按上述固定配置完成，完整结果见下一节。它确实将所有 Turn 2+ 判为 PPD，因此验证了预期的 live-Agent 退化行为；Static/Dynamic 的 raw wall/cache 差异同时伴随显著 trajectory 差异，不能解释为策略收益。
 
-## 十、2026-09-08 frozen-map 原始 Dynamic、16 episodes、c=14 结果
+## 七、2026-09-08 frozen-map 原始 Dynamic、16 episodes、c=14
 
 ### 1. 配置、路由和数据完整性
 
