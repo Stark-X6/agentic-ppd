@@ -1,6 +1,8 @@
 # 阶段 5：KV 与负载感知的 PPD 查表方案及 TTL 接口
 
-初次记录：2026-10-10。最近整理：2026-10-23。
+初次记录：2026-10-10。最近整理：2026-10-27。
+
+研究顺序更新（2026-10-27）：先执行 [假设验证与改进空间实验设计](./stage5-hypothesis-validation-experiment-design.md)。本文保留变量推导与此前候选方案，不把高维查表、窗口积压修正或 TTL 视为已证明必要的组件；是否实现以及采用哪些输入，由小规模配对实验、真实状态频率和观测开销决定。字段语义与 baseline 不变，尚未开展本轮 GPU 实验。
 
 状态：第一步语义冻结已完成；[规范契约](/root/vllm-ppd/docs/stage5_state_semantics_contract.md) 是字段边界与统计口径的准据。第二步已实现默认关闭的节点观测接口、就绪记录和独立 pending 账本并通过 CPU 校验，原生 GPU/IPC 验收及 proxy 自动身份映射仍待完成，详见 [只读观测实现](/root/vllm-ppd/docs/stage5_readonly_observer.md)。新查表与校准未实施，冻结配置不变，未启动 GPU 实验。
 
