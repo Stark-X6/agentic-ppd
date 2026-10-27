@@ -731,3 +731,122 @@ Static c=14 中 8201 曾达到 KV p90/max=98.3%/100% 并产生全部 15 个 loss
 原始 Dynamic reproduction 到此完成：loader、2P_2D、Turn 1 forced PD、Turn 2+ decision、tool-last-message、exact append、calibration metadata、routing affinity 和请求级 profiling 均已真实验收。结果不是“Dynamic 有效降低 eviction”，而是“原始 Dynamic 在 live Agent 上 100% 选择 PPD，无法区别于 x=1”。
 
 下一步不需要重复原始 Dynamic。建议进入 Agent-compatible Dynamic 单变量 ablation，先后验证 actual-output predictor、压力/QPS 信号、512 bypass 和 Agent context calibration；每轮仍固定 sample/map/concurrency。TTL 单独评估时，Static c=14 用作 knee、c=16 用作 stress；在宣称减少 eviction/recompute 前，应先加入 token-LCP 或 block-level eviction/offload/restore 事件。严格性能主表最终用 request/tool-gap replay，live Agent 保留为 end-to-end 生态验证。
+
+## 八、2026-09-09：阶段 5 CPU 决策可达性审计
+
+本次不是新的 live/GPU 实验。目的：检查在旧 calibration 固定时，修改 output/QPS/bypass 是否有机会改变原始 Dynamic 的动作；避免消耗 GPU 验证一个始终返回相同值的策略。
+
+### 1. 审计配置
+
+- PPD commit：`11dccb5d64d90910af42d9f46e06cc4e431c01dc`。
+- calibration：`/root/vllm-ppd/results/comprehensive_qwen3_thinking_bf16_155648_matched_clean_qps_le4`。
+- base config：`2P_2D`；`w_ttft=w_tpot=1`；`default_use_ppd=true`。
+- 仅在 CPU 检查进程设置 `PPD_BYPASS_THRESHOLD=0`，未改运行配置文件/启动参数。
+
+### 2. 结果
+
+| 项目 | 结果 |
+|---|---:|
+| 实际 loaded matched pairs | 72 |
+| lookup cells（2 context × 9 workload × 10 QPS） | 180 |
+| 实测 finite score | 72 |
+| score min / max | 0.0040941662 / 0.8661177467 |
+| 实测 score ≤ 0 | 0 |
+| score=inf、PD 失败强制 PPD | 0 |
+| 缺失 pair 使用默认值 | 108 |
+| lookup 中 PPD / PD | 180 / 0 |
+| 关闭 bypass 后特征扫描 | 4,320 |
+| 扫描结果 PPD / PD | 4,320 / 0 |
+
+特征扫描范围：
+
+- append：0、16、74、128、256、512、1024、4096、30707；
+- output：1、32、64、128、256、512、721、1839、4096、16384；
+- context：0、256、2048、4096、32768、155000；
+- QPS：0、0.2、0.5、1、2、4、10、20；
+- 固定 turn=2。
+
+决策来源：matched score 2,160、缺失 pair 默认 720、huge→large 1,080、huge 缺失默认 360。扫描包括没有 clean calibration 的高 QPS，只用于暴露 fallback 行为，不代表这些点已跑过 GPU benchmark。
+
+这还是一个结构性结果：所有已测 score 为正，所有缺失 cell 默认 PPD，huge 继承 large/默认值，因此在当前权重/默认值下，正常 Turn 2+ 输入无法选到 PD。原始 bypass 只是另一条返回 PPD 的提前路径。
+
+### 3. CPU 复查命令
+
+只加载 JSON 和运行决策函数，不启动模型或请求服务：
+
+```bash
+PYTHONPATH=/root/vllm-ppd python - <<'PY'
+import itertools
+import logging
+import math
+import os
+from collections import Counter
+from ppd.optimizer.ppd_decision_engine import PPDDecisionEngine
+
+logging.basicConfig(level=logging.ERROR)
+engine = PPDDecisionEngine(
+    "/root/vllm-ppd/results/comprehensive_qwen3_thinking_bf16_155648_matched_clean_qps_le4",
+    base_config="2P_2D",
+    default_use_ppd=True,
+    w_ttft=1.0,
+    w_tpot=1.0,
+)
+scores = [entry["score"] for entry in engine.performance_data.values()]
+finite = [score for score in scores if math.isfinite(score)]
+print("matched_pairs", len(scores), "lookup_cells", len(engine.lookup_table))
+print("lookup_actions", Counter(engine.lookup_table.values()))
+print("finite_scores", len(finite), "min", min(finite), "max", max(finite))
+
+# 此 env 仅作用于本 Python 进程，不修改 config.sh。
+os.environ["PPD_BYPASS_THRESHOLD"] = "0"
+actions, sources = Counter(), Counter()
+grid = itertools.product(
+    [0, 16, 74, 128, 256, 512, 1024, 4096, 30707],
+    [1, 32, 64, 128, 256, 512, 721, 1839, 4096, 16384],
+    [0, 256, 2048, 4096, 32768, 155000],
+    [0, 0.2, 0.5, 1, 2, 4, 10, 20],
+)
+for append, output, context, qps in grid:
+    use_ppd, metadata = engine.decide_with_metadata(
+        turn=2, input_tokens=append, output_tokens=output,
+        context_tokens=context, current_qps=qps,
+    )
+    actions["PPD" if use_ppd else "PD"] += 1
+    sources[metadata["decision_source"]] += 1
+print("actions", dict(actions))
+print("sources", dict(sources))
+PY
+```
+
+### 4. 对下一阶段的影响与限制
+
+- 修 output/QPS 可能改变分类/选中 cell，但旧表上不改变动作。不能据此做完整 live A/B 再声称验证了这些特征的路由价值。
+- 全正 score 不证明 x=1 在长 context、不同 residency/压力下永远最优；最小 score 接近零，测量噪声和校准适用域仍重要。
+- 第七章末尾原先建议的“先后逐项跑 output/QPS/bypass”由本次审计补充：先做 PD 获益区间验证，再进行有动作区分度的消融。保留第七章为当时记录，不回改其历史结论。
+- 论文/源码理论分析和下一步建议见 [阶段 5 研究与阅读指南](./stage5-agent-compatible-dynamic-theory.md)；handoff 只更新当前结论与计划状态。
+
+## 九、2026-10-23：只读观测 CPU 验收与微基准
+
+本节是 CPU 工程验证，不是 SWE-bench/GPU serving 结果。未开启 server 或修改 Agent、2P:2D、map、原 decision score；新开关默认关闭。
+
+实现与运行边界见 [只读观测说明](/root/vllm-ppd/docs/stage5_readonly_observer.md)。新增 observer 47 项、mock API 19 项、pending ledger 22 项，加前序语义 46 项与 calibration 4 项，共 138 项 CPU 测试通过。覆盖前缀就绪、取消/抢占代次、重复登记/回收、decode 分类、较小 chunk 的容量风险、unknown/null、pending/终止去重、API 关闭/鉴权/限流和 timeout 后 single-flight。
+
+### 1. 开销测量
+
+21 轮交替空操作/观测对照，运行时无并发测试进程。对象为假 scheduler/cache，使用 chained SHA256 替代 hash，不包含 native hasher、tokenizer、HTTP、IPC 或 GPU 工作。每个数据行是一个组合场景，不用于分离 batch 与 prefix 长度的独立影响。
+
+| 活跃请求数 | Probe tokens | State-only 中位/ms | State+probe 中位/ms | State+probe p95/ms |
+|---:|---:|---:|---:|---:|
+| 16 | 4097 | 0.060 | 1.716 | 1.745 |
+| 64 | 32769 | 0.185 | 13.744 | 68.878 |
+| 256 | 131073 | 0.736 | 106.783 | 161.351 |
+
+另测 64-token 和 8192-token chunk 的就绪记账 callbacks。8192-token 场景为 512 blocks 登记/回收加 batch 生命周期，增量中位约 1.34～1.64 ms；不是每个 decode step 的固定开销。
+
+[原始 JSON 与源文件指纹](/root/vllm-ppd/docs/measurements/ppd_observer_cpu_20261023.json) 保留所有分位数和命令；[基准脚本](/root/vllm-ppd/scripts/benchmark/benchmark_ppd_observer_cpu.py) 可在 CPU 上复跑。进程内重复不等于独立 GPU run，不能据此声称线上开销小于某个百分比。
+
+### 2. 结论与未完成项
+
+State-only 假负载查询较轻；长 prefix probe 的 CPU 成本和尾部抖动不可忽略，不宜直接按 10 Hz 上限轮询每个长 prompt。需要真实环境进一步测量并考虑复用已有 hash/降低查询频率。
+
+节点 API 与就绪 hook 已接线，但未在原生 EngineCore/IPC/GPU 中验收。PendingLedger 仍为独立组件，production proxy 尚未自动建立物理 ID/终止 ACK 映射。TTL 无动作，AMPD gate 和新 lookup 未启用。下一步应先开卡做小规模只读 smoke 与 off/on 开销对照，不能直接跳到新路由性能实验。

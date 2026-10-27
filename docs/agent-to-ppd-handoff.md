@@ -1,28 +1,31 @@
 # Agent 修复阶段总结与 PPD/TTL 改动计划
 
-更新时间：2026-09-09
+更新时间：2026-10-23（只读观测实现与 CPU 验证；GPU/原生 IPC 验收待开卡）
 
 ## 结论
 
-Agent 与 PPD 的 baseline contract 已经冻结：Agent 侧的 token 预算、thinking/reasoning 回放、结构化工具、截断重试和 trace 语义已稳定；PPD 侧的精确 append、calibration loader、matched routing、logical retry 以及请求级 profiling 也已完成。后续 serving 对照实验应固定现有模型、Agent/PPD commits、样本集合、routing map、temperature 和 token 参数，不再同时修改 Agent 行为。
+Agent 与 PPD 的 baseline contract 已经冻结：Agent 侧的 token 预算、reasoning 回放、结构化工具、截断重试和 trace 语义，以及 PPD 侧的 append 计数、calibration loader、matched routing、logical retry、请求级 profiling，均已完成相应验收。后续 serving 对照保持模型、Agent 行为、样本、routing map 和 token 参数不变；详细运行结果继续写入 [实验记录](./agent-ppd-experiment-log.md)，本文只更新当前判断与计划状态。
 
-原始 PPD Dynamic 的 offline calibration 和 live Agent 执行链路都已复现。最新视角不是“Dynamic 已降低 cache loss”，而是：原始 Dynamic 在当前 live Agent workload 上退化为 Static `x=1`，根因集中在 requested-max output、lifetime-average QPS、short-append bypass 和 huge-context 外推这四类特征/策略契约。Static 与 Dynamic 的 live trajectory 又会明显分叉，因此两轮只能作为 config-matched 生态验证，不能把 wall time、KV 压力或 cache-loss 差异直接归因于 serving policy。
+原始 Dynamic 已完成 offline/live 复现。当前权重下，72 个实际 matched pair 的 score 全为正，另 108 个缺失 cell 默认 PPD，合计 180 个 lookup cell 均选 D-local；关闭 short bypass 后扫描仍全部选 PPD。因此，修 output、QPS 或 context 特征虽然必要，却不能单独让旧表产生 PD 动作。最小 score 接近零，也不能把这一结果推广为“所有负载下 x=1 永远最优”。
 
-当前 Static 基线已经确定三个工作点：c=12 是 healthy control，c=14 是 operational knee，c=16 是 stress control。现有 cached-token retention 能发现“可复用前缀没有命中”，但还不能区分容量驱逐、prefix divergence、block 对齐、offload 或 restore；在评价 TTL 前必须补 token-LCP 或 block-level eviction/offload/restore/recompute 证据。
+阶段 5 第一版已收敛为**实际 KV 与负载状态条件化的 PPD 查表**：用 (N,U_P,U_D) 描述当前请求，用 (B_D,K_D) 描述 D 的 decode 背景，以 P/D 各自的 (Q_tok,Q_att) 描述 prefill 积压；保留原 TTFT/TPOT score 与现有权重。AMPD 前置 TTFT/ITL 路由和精细 F/W/X 预测后置，TTL 当前只留接口。固定 2P:2D 与 affinity，不以提高 P 利用率或 PD 占比为目标。变量推导和当前计划以 [阶段 5 当前方案](./stage5-state-aware-routing-and-ttl-design.md) 为准；[早期问题与备选方案](./stage5-agent-compatible-dynamic-theory.md) 保留研究过程。
 
-下一阶段是 Agent-compatible Dynamic 的单变量 ablation，依次处理 output 预测、压力/QPS 信号、short-append bypass 和 Agent context calibration；之后再集成 Continuum TTL。严格 serving 因果主表最终应使用录制 request body 与 tool gap 的 replay，live Agent 保留为端到端真实性和质量验证。
+c=12 healthy、c=14 operational knee、c=16 stress 是当前模型、样本和轨迹下的实验工作点，不是普适并发上限。固定 map 控制了节点分配，但 live Agent 仍可能走出不同轨迹；严格 serving 因果比较还缺 request/tool-gap replay。现有 retention 只能发现前缀未命中，不能单独判定容量驱逐。将来实现 TTL 仍需 block/LCP 证据与 pin 生命周期保障，Static x=1 的独立验证保留为后续对照，本轮不启动。
 
-详细的 CPU/live 验收、正式 run 数据、分位数、cache-loss 表和可复现性限制统一记录在 [Agent × PPD 实验记录](./agent-ppd-experiment-log.md)；请求字段定义见 `/root/vllm-ppd/docs/agent_serving_contract.md`。
+“正常时优先 TTFT”未被确认为最终目标。第一版固定原评分是为了控制变量；Agent 完成时间、完整响应/tool-ready、累计 LLM 等待、超时和任务结果仍需联合评价，最终主指标和约束阈值尚待冻结。输入与结果语义已冻结为 [ppd-state-semantics-v1](/root/vllm-ppd/docs/stage5_state_semantics_contract.md)。现已加入默认关闭的 [节点只读观测 API 与就绪记录](/root/vllm-ppd/docs/stage5_readonly_observer.md)，以及独立 pending 账本；CPU 验证已完成，原生 GPU/IPC 和 proxy 身份对账尚未验收，新分类与校准也未实施。
 
-当前代码状态：
+关于文献比较，AMPD 中的 vLLM-Continuum 是 co-located baseline，其 TTFT 收益未必转化为 ITL/SLO 收益；这不等于已经验证“TTL 移植到 PD 后性能退化”。所读 PPD 版本也没有直接给出该对照。PPD 与 TTL 能否互补仍是研究假设，不是已有结论。
 
-- uni-agent 分支：`fix/agent-tool-contract`
-- uni-agent 最新提交：`449f80f4383b Add stable routing identity to agent profiles`
-- vllm-ppd 分支：`fix/agent-tool-contract`
-- vllm-ppd contract 提交：`ddffde8fcc9b Freeze matched routing and request profiling contracts`
-- vllm-ppd 最新提交：`11dccb5d6 Fix small-sample percentiles and TTFT detection`
-- uni-agent 比 GitHub origin 超前 1 个本地提交，vllm-ppd 超前 2 个，均尚未 push
-- 两个代码仓库的 `agentic-ppd-baseline-v1` tag 均保持不变
+现有请求字段见 [serving contract](/root/vllm-ppd/docs/agent_serving_contract.md)，新增状态定义见独立 v1 契约；旧 trace 不自动升级。本次添加了默认关闭的 engine/cache 元数据 hook 与只读接口，但没有改原评分或开启新路由、AMPD gate、TTL，也没有启动 GPU 实验。CPU 开销数据单独写入实验记录，不视为真实 serving 性能。
+
+### 复现使用的代码基线
+
+以下保留已验收的提交标识，不作为当前远端同步状态声明：
+
+- uni-agent：`fix/agent-tool-contract`，`449f80f4383b Add stable routing identity to agent profiles`；
+- vllm-ppd：`fix/agent-tool-contract`，contract 提交 `ddffde8fcc9b`，复现基线 `11dccb5d6 Fix small-sample percentiles and TTFT detection`；
+- 两仓库的 `agentic-ppd-baseline-v1` 是更早的基线标记，后续修复不应通过移动旧 tag 混入该版本；
+- 新实验另行记录实际 commit、dirty diff、配置和 calibration fingerprint。
 
 ## 一、Agent 侧已经完成的修改
 
@@ -46,7 +49,7 @@ Thinking 模型的 assistant `content` 可以为空，因为思考过程位于 `
 - prompt、completion 和 cached tokens；
 - finish reason。
 
-PPD 配置启用 `replay_reasoning=true`。下一轮请求会带回上一轮 reasoning，从而同时保留 Agent 计划、还原真实生成前缀，并使 prefix-cache、cache-loss 和 TTL retention 具有一致语义。
+PPD 配置启用 `replay_reasoning=true`。下一轮请求会带回上一轮 reasoning，保留 Agent 计划并减少因省略思考内容造成的前缀差异。但实际可复用长度仍取决于完整 chat template 的 token 序列、token-LCP 和 block 对齐，启用回放不保证生成前缀逐 token 完全一致。
 
 ### 3. 截断 tool call 的容错
 
@@ -139,7 +142,7 @@ Proxy 以最近一个 assistant message 为边界：
                     |
                     +-- current append
 
-Append 使用与模型一致的 tokenizer 和 chat template 计数，解决 Agent trace 与 proxy 对工具增量长度统计不一致的问题。当前还记录：
+Append 使用与模型一致的 tokenizer 和 chat template 对最新 suffix 计数，解决此前遗漏工具返回内容的问题。这里的精确是 suffix 的 tokenizer 计数；完整 prompt 的真实增量仍需处理模板边界，历史 context 目前仍有字符估算。逻辑 append 也不等于某节点实际必须重算的 tokens。当前还记录：
 
 - `feature_token_estimator`；
 - `append_tokens_fallback_est`；
@@ -174,6 +177,8 @@ Agent 从 SWE-bench task 的 `metadata.instance_id` 生成 routing key，经 Con
 
 正式 paired run 必须设置 `PPD_ROUTING_MAP_STRICT=true`；缺 key、缺 role 或 slot 越界均 fail closed。每个 timing row 和 `/status` 记录 contract version、seed、map fingerprint、候选节点、slot 和 assignment source。`legacy_hash` 只用于历史行为诊断。
 
+稳定 SHA-256 只保证可复现，并不保证有限样本恰好均分。上述显式 map 固定前 16 条的 8/8 episode 分配，用来控制对照实验中的 placement 差异；原始 hash 出现不均衡不等于路由实现错误，8/8 也不等于 token、请求数或瞬时 GPU 压力相等。正常多轮过程中复用已分配的 P/D affinity，Dynamic 改的是在固定 P 或固定 D 上做 prefill，不是每轮把 decode 迁往另一 D。故障、节点变化和状态重置应另行报告。
+
 同一 Agent step 的 transport retry 和 required→auto retry 复用 `client_request_id`。Proxy 只在第一个 physical attempt 上递增 logical turn 并完成一次路由/Dynamic 决策；后续 attempt 复用 turn、地址、route、decision features、QPS snapshot 和 calibration cell。所有统计明确区分 logical request、physical attempt 和 retry。
 
 ### 4. 请求级 profiling 与协议语义
@@ -203,103 +208,104 @@ Analyzer 在 run 目录生成：
 
 原始 Dynamic 算法未在复现阶段修改。新增字段包括 `decision_source`、requested/selected QPS、`selected_calibration_cell` 和 calibration availability；窗口 QPS 只记录，不参与原始决策，retry 不计入 logical QPS。完整定义见 `/root/vllm-ppd/docs/agent_serving_contract.md`。
 
-## 四、PPD 当前的核心问题
+## 四、PPD 当前的问题与备选解决方案
 
-### P0：matched routing 已解决，严格 serving 因果仍缺 request replay
+本章保留基础适配和拓展适配的问题分类。当前从候选池中选定状态条件化查表，原评分不变，另建匹配实际 KV/负载的新 calibration；旧表只换字段不会产生新证据。未被选中的预测器、反馈门控和 TTL pin 不属于第一版任务。完整旧问题见 [早期理论方案](./stage5-agent-compatible-dynamic-theory.md)，当前取舍见 [阶段 5 当前方案](./stage5-state-aware-routing-and-ttl-design.md)。
 
-稳定 routing map 解决了跨配置 episode 身份与节点分配不可复现的问题，但 8/8 episode assignment 不保证两节点的 request 数、token 数、瞬时 resident KV 或 wall time 相等。即使固定 `temperature=0`，live Agent 仍会因 batching、数值差异、失败重试和工具 observation 走出不同 step 数与上下文。
+### 4.1 基础适配：修正特征含义、校准范围与决策解释
 
-因此后续报告必须继续按节点列 episodes、logical/physical requests、prompt/completion tokens、KV、waiting、queue 和 preemption。Live Static/Dynamic/TTL 只做 config-matched 生态验证；严格 speedup、cache-retention 和 recompute 因果比较需要录制相同 request body、arrival/tool gap 后 replay。
+| 问题 | 已确认现状 | 备选方案与取舍 |
+|---|---|---|
+| B1 output 长度 | Live proxy 将 `max_tokens`/`max_completion_tokens` 当作 output 特征；ShareGPT benchmark 则读取记录中回答的 token 数并控制生成长度，并无可部署的预测器 | 第一版保留生成上限，但查表改用 N/U_P/U_D，不预测本轮 output；last/median/EWMA 和组件成本路由仅保留为历史备选 |
+| B2 QPS 与 concurrency | 原决策用此前 logical requests/proxy uptime；已有 1/5/10/60 秒窗口只用于 profiling。Offline QPS 是 conversation arrival，live 是 LLM request arrival | 先明确到达对象、窗口和 retry 分母，再做同单位 calibration 或新模型。活跃 episode、in-flight requests、engine running/waiting 分开记录，不能拿 concurrency 直接替代 QPS |
+| B3 short bypass | append<512 提前选 D-local；短 observation 不保证 D 历史还在，也不保证本地 prefill 无干扰 | 保留原规则作 baseline；关闭/降阈值是敏感性方案；按实际未命中量与延迟成本决定 bypass 更合理，但依赖拓展适配。旧表全正时仅关闭 bypass 仍不改变动作 |
+| B4 context 与 workload 覆盖 | 原始历史锚点仅 256/2048 tokens，4096 是分类边界；长 Agent context 外推 large。Suffix 已计数，完整 prompt/context 与模板边界仍需对齐 | 选择真实长 context 和两端前缀状态配对校准。N/U_i 已隐含 C_i，H/A 另作日志；连续耗时拟合不是第一版前提，不能只改阈值不补数据 |
+| B5 lookup 动作与优化目标 | 当前 72 个实测 score>0，108 个缺失 cell 默认 PPD；输入修正可改 cell，却改不了动作 | 先审计 fallback 与边界，再验证 PD 获益区间。保持等权公式，不用调权重、默认值或 P:D 比例人为制造 PD；新目标须另命名、单独对照 |
+| B6 placement 与可复现性 | 稳定 hash 不保证均分，显式 8/8 map 也不保证工作量均衡；live 轨迹仍会分叉 | 保持 map/affinity 控制 placement，逐节点报告真实负载；严格 serving 对照另补 replay，见 4.3 |
 
-### P1：原始 Dynamic 特征不适配 live Agent
+等权时原始策略使用：
 
-详细观测分布见 [实验记录第七章](./agent-ppd-experiment-log.md)。当前需要拆成四个单变量问题。
+```text
+S = (TTFT_PD − TTFT_local) / TTFT_PD
+  − (TPOT_local − TPOT_PD) / TPOT_PD
+有效 calibration 且未被 bypass：S > 0 选 local；S ≤ 0 选 PD。
+```
 
-#### 1. output_tokens 使用请求上限
+因此，PD 出现的条件是 local 的相对 TPOT 代价足以抵消其相对 TTFT 收益，或 PD 连 TTFT 也更好。更高 QPS 不保证满足这一条件：P 排队或传输越拥堵，反而越可能偏向 local；D 正在密集 decode、追加 prefill 干扰较大而 P 有余量时，PD 更可能获益。增加 P:D 也不是必然解，且改变资源容量与校准适用域，本阶段保持 2:2。
 
-Proxy 使用 `max_tokens`/`max_completion_tokens` 作为预期输出，而 Agent 的 per-turn 上限远大于多数真实 completion，使 workload class 系统性偏向长生成。候选改法是用近期真实 completion 的 rolling median/p90 或简单预测器，同时保留 requested max 作为对照字段。
+该 score 不是预计节省的总秒数，也不直接保证吞吐或 SLO。非流式 Agent 要等完整 response 才能执行工具，后续必须同时报告 full-response/tool-ready 时间、TTFT/TPOT、队列、失败和 goodput，不能只看 P 使用率。
 
-#### 2. QPS 使用 lifetime average
+### 4.2 拓展适配：引入决策时可用的执行状态
 
-原始策略使用 stack 启动以来的累计 logical requests 除以累计运行时间。工具执行和 Modal 等待会持续稀释该值，它既不是瞬时 arrival rate，也不是 scheduler pressure。
+| 问题 | 为什么原特征不够 | 备选方案与边界 |
+|---|---|---|
+| E1 实际 KV residency | 历史长度 H 不等于 P/D 可复用前缀 C_P/C_D；response cached_tokens 是事后结果 | 节点提供无副作用的 prefix/block 查询，或维护带时间戳的 cache 目录；估算只作低置信度 fallback。查询后还会发生 eviction，需执行时复核或有界 reservation，不能把快照当作命中承诺 |
+| E2 队列、decode 干扰与滑动窗口 | 相同 arrival QPS 可对应不同排队工作量、长上下文 decode 和容量压力；事后 load max 不能作在线特征 | 第一版使用 B_D/K_D 与两端 Q_tok/Q_att 类别，分别记录实际 scheduled/blocked/pending。TTFT/ITL/QPS 窗口先作 profiling，不启用 AMPD 前置路由 |
+| E3 单向数据面与正确路径成本 | 当前 producer→consumer 路径没有 D→P 历史回传。P 可能复用自己保留的历史，也可能因多轮 local 而远落后于 D | 在现有 connector 上建模 P/D 各自未命中量、排队、计算和实际传输；不假定回 P 只计算 observation。双向传输列为独立系统方案，需要 pin/merge/布局与并发保障 |
+| E4 目标、预测误差与 fallback | 平均 TTFT/TPOT 不能反映所有 ITL 尖峰或对其他请求的干扰；过时指标会选错路 | 第一版固定原 score/权重，表外、近零 score 与过时状态须明确回退。容量检查不等于保证准入，Remote 仍需 D 保存 KV；最终 Agent 目标不能直接等同 TTFT 最小化 |
+| E5 cache loss 与 TTL 收益边界 | prefix 未命中不一定是容量驱逐，保护更多 KV 也可能挤压其他请求 | 先补 token-LCP、实际 block eviction、后续重算与活跃 preemption 证据；区分自然命中与额外保护收益，不从 loss 数量直接推断 TTL 效果 |
+| E6 TTL 移植与路由耦合 | 公开固定阈值 pin 不等于论文完整估计器；保护价值取决于回访路径 | 当前只定义状态和生命周期接口，不 pin/unpin；固定 TTL、论文式效用、优先级及 route-aware TTL 均后置独立验证 |
 
-当前 profiling 已同时记录 lifetime QPS、1/5/10/60 秒 window arrival、active episodes、waiting、running、queue 和 KV。下一阶段分别测试 sliding-window arrival 与 queue/KV pressure；在单变量实验前不改变原始定义。
+AMPD 在线路由可以不使用当前最终 output 长度，但它并非完全免预测：仍需 prefill/传输成本及新鲜节点状态。原 Algorithm 1 先查 P 的 TTFT 余量，再查 D 的 ITL 余量，最后比较成本；不能将其概括为“每次都计算成本取最小”。我们固定候选 P/D、保留单向 connector 的方案只能称为 AMPD-inspired。
 
-#### 3. short-append bypass
+TTL 决策发生在 response 完成、等待工具期间，路由发生在下一请求到达时。保护 D cache 可能减少下一轮 local 重算；长工具 gap、过多 pin 或 decode 瓶颈也可能使 TTL 无收益甚至变慢。Continuum 公开代码缺少论文完整估计器，固定阈值 pin 与论文效用策略必须分别命名。TTL 到期是解除保护，不等于立即 eviction，更不是 offload。
 
-原始策略在 append `<512` tokens 时直接选择 PPD，大量短工具 observation 因而完全绕过 calibration。后续依次比较原阈值、128/256 和关闭 bypass，并用实际 append 分布解释结果。
+### 4.3 对照实验仍需控制的因素
 
-#### 4. Huge context 外推与 offline mismatch
+稳定 map 已解决跨 run 的 placement 漂移；是否强制样本数均分属于实验设计选择，不是 PPD 正确性的必要条件。报告继续按节点列 episodes、requests、tokens、KV 与 queue，避免把 8/8 当作负载均衡。
 
-原始 calibration 的最大 context class 远小于长程 live Agent context；huge 请求只能外推到 large cell。与此同时，offline benchmark 是固定两轮、固定输入输出且没有工具间隔，真实 Agent 则包含 reasoning、动态 observation 和不规则 think time。
+Live Agent 继续用于 profiling 和生态验证。固定 temperature/sample/map 仍不能固定生成轨迹；严格 serving 对照需要明确 completion 工作量、retry 和依赖关系的 request/tool-gap replay。同 episode 的 closed-loop gap 回放与固定绝对 arrival 的 open-loop 压力测试不能混称。
 
-Offline calibration 足以验证原始 Dynamic 流程，却不能证明其 cell/score 适合 live Agent。后续先保持原表作为 reproduction baseline，再增加 Agent-derived context/output calibration；两者必须分别报告。
-
-### P2：缺少 TTL-aware cache policy 与可验证事件
-
-当前系统没有显式 KV offload 层，也没有按 Agent 预计返回时间管理 cache block。`cached_tokens` retention 只能说明下轮没有命中全部可复用前缀，不能单独证明容量 eviction，更不能判断数据是重算、offload 还是 restore。
-
-集成 Continuum 前需要：
-
-- 给 conversation/cache block 增加 TTL 或预计复用时间；
-- 由 Agent/proxy 传递和记录 tool gap/next-arrival 预测；
-- scheduler 在内存压力下优先驱逐已过期或低复用价值 KV；
-- 保留 PPD connector 与 NCCL KV transfer；
-- 增加 token-LCP 或 block-level eviction、offload、restore、recompute 事件；
-- 将 prefix divergence、alignment loss 与容量 eviction 分开统计。
-
-Static c=14 knee 用于观察策略是否能在刚出现容量压力时减少 loss；c=16 stress 用于验证 TTL 在高压下的稳定性与代价。没有上述事件证据前，不把 retention 改善直接写成 TTL 减少 eviction。
+当前 knee/stress 工作点可用于机制验证，但换模型、样本、工具行为、上下文或 routing contract 后需要重新检查。所有预测只使用决策时可见的信息；本轮实际 completion、下一轮 cached tokens、最终 episode 步数和事后 queue/load max 只作分析标签。
 
 ## 五、后续工作与阶段状态
 
 ### 阶段 1：冻结 Agent contract（已完成）
 
-Token/reasoning/tool/trace/Modal contract 已完成并冻结在 uni-agent `449f80f4383b` 与当前 YAML。后续 serving A/B 不再改变 ReAct policy。
+Token/reasoning/tool/trace/Modal contract 已完成并冻结在 uni-agent `449f80f4383b` 与当前 YAML。后续 serving A/B 不改变 ReAct policy；新协议缺陷单独修复和验收。
 
 ### 阶段 2：冻结 matched routing 与 retry contract（已完成）
 
-稳定 routing key、strict frozen map、logical/physical retry identity 和 fingerprint 已实现并完成 CPU/live 验收。历史 `legacy_hash` 结果只保留作诊断样本。
+稳定 routing key、strict frozen map、logical/physical retry identity 和 fingerprint 已完成 CPU/live 验收。保留默认稳定 hash 与显式 balanced map 的区别；正常路由维持 D affinity，不把跨 D 迁移混入 Dynamic。
 
 ### 阶段 3：确定 Static 工作点并复现原始 Dynamic（已完成）
 
-Static c=12 healthy、c=14 operational knee、c=16 stress 以及同配置原始 Dynamic c=14 均已完成。原始 Dynamic 在 live Agent 上等价退化为 `x=1`，不再重复该 baseline。完整数据与限制见 [实验记录](./agent-ppd-experiment-log.md)。
+已完成当前 workload 的 Static c=12/c=14/c=16 与原始 Dynamic c=14。原始 Dynamic 本次动作等价于 x=1；无需在相同旧表上为纯输入替换重复完整 baseline。详细结果与限制见 [实验记录](./agent-ppd-experiment-log.md)。
 
-### 阶段 4：冻结请求级 profiling/协议语义（已完成）
+### 阶段 4：冻结请求级 profiling/协议语义（已完成现有契约）
 
-P/D request phases、TTFT/preemption/tokens、ORCA/load windows、logical retry、decision source/cell、exact append、lifetime/window QPS 和 retention 字段均已进入 schema 化 artifact。当前证据是 request-level elapsed 与 lost reusable prefix，不冒充纯 kernel recompute 或 block eviction。
+P/D phases、TTFT/preemption/tokens、ORCA/load、retry、decision source/cell、append 和窗口 arrival 已进入 artifact。此处“完成”不包括决策前 residency API、实时逐迭代 ITL、纯 NCCL bytes/time、block eviction 生命周期和 replay；这些是阶段 5/6 明确新增的能力。
 
-### 阶段 5：Agent-compatible Dynamic ablation（下一步）
+### 阶段 5：KV/负载状态条件化的 Dynamic 查表（语义与观测 CPU 验证完成，原生验收/策略待实施）
 
-保持模型、Agent commit、前 16 条 sample、frozen map 和选定 concurrency 不变，一次只修改一个变量：
+维持 2P:2D、固定 P/D affinity、模型、Agent contract、前 16 条样本与 map。当前完成旧表可达性审计和问题/备选方案整理，未实现 output predictor、窗口驱动决策或 state-aware router。
 
-1. 用历史真实 completion 预测 output tokens；
-2. lifetime QPS 改为 sliding-window arrival 或 queue/KV pressure；
-3. 调整或关闭 512-token bypass；
-4. 增加 Agent-derived context calibration；
-5. 最后才组合已经单独验证有效的特征。
+第一版输入为 (N,U_P,U_D)、D 的 (B_D,K_D)，以及 P/D 各自的 (Q_tok,Q_att)。H/A 是逻辑历史与新增，C_i 才是节点有效前缀；U_i=N−C_i。对可执行/执行中的背景 prefill 及去重 pending，用 R_r=N_r−E_r 汇总 Q_tok=ΣR_r 与 Q_att=Σ[E_rR_r+R_r(R_r+1)/2]；blocked 与待决策本请求不混入该集合。这些是工作量而非毫秒，E_r 不能直接取尚未完成的 scheduled 进度。
 
-每轮同时报告策略选择比例、实际 workload、每节点压力、失败重试、quality 和 trajectory 差异。若仍使用 live Agent，只能称为生态 A/B；严格性能主表使用 request/tool-gap replay。
+2026-10-22 已完成第一步“冻结输入与结果语义”：新增 [规范契约](/root/vllm-ppd/docs/stage5_state_semantics_contract.md)、[CPU 参考函数](/root/vllm-ppd/ppd/optimizer/state_semantics.py) 和 [单元测试](/root/vllm-ppd/tests/test_state_semantics.py)。冻结 H/A 前缀证明、有效 C<N、decode 同步边界与 L=N+G−1、E≤S≤T、物理 pending 去重，以及 candidate Turn 2/首 attempt/非 warmup 的请求加权统计。缺失值用 null，不当成零。
 
-### 阶段 6：集成 TTL
+CPU 验收为新语义 46 项、原 calibration 契约 4 项 unittest 通过；扩展 pytest 回归未执行（当前环境缺 pytest），没有安装依赖。Agent/服务配置、first16 map 和原决策文件指纹不变。该验收不包含真实引擎状态导出或新路由性能。
 
-在 Static PPD 上先单独验证 Continuum TTL，再与 Agent-compatible Dynamic 组合：
+测量来源特别分离：旧 score 使用 client-stream 首文本 TTFT/TPOT；D engine TTFT 不含 P 阶段；poller 的旧 `tpot` 别名是 ITL 事件直方图，不是 request-mean TPOT。当前非流式精确 route-wide 首生成 token 仍未观测，不能用于新路径胜负标签。参考函数未被 proxy/engine 导入，不说明状态采集已实现。
 
-| 配置 | 用途 |
-|---|---|
-| 2P_2D，`x=0` | PD 基线 |
-| 2P_2pD，`x=1` | Static PPD 基线 |
-| 原始 Dynamic | 论文复现 baseline |
-| Agent-compatible Dynamic | Agent 特征适配 |
-| Static PPD + TTL | 隔离 TTL 收益与代价 |
-| Dynamic + TTL | 最终组合方案 |
+后续按以下依赖推进，分桶边界、回退细则及实验点尚待确认：
 
-建议工作流：
+1. **5A 状态观测（实现与 CPU 验证已完成，GPU 验收未完成）。** 默认关闭的 `/v1/ppd/observe` 经 owner-thread utility 导出状态；独立 block 就绪记录处理登记/完成/回收，缺证据返回未知。Pending 账本已独立测试，尚未挂入 proxy 派发链路，需核实原生 request ID 和终止 ACK 映射。开销已做 CPU 假负载测量；真实长前缀、NCCL、IPC 与 off/on serving 对照需要开卡。见 [实现说明](/root/vllm-ppd/docs/stage5_readonly_observer.md) 和 [实验记录第九章](./agent-ppd-experiment-log.md)。
+2. **5B 配对状态校准。** 选择真实长 context、不同 P/D 复用和 decode/积压背景，恢复可比起点后测两路径。沿用 TTFT/TPOT 口径并保留失败；旧均值不能重新命名为新状态标签。
+3. **5C 新表与 shadow。** 保留原 score 和 w_ttft=w_tpot=1，输出 Local/Remote，同时保存实测指标、波动与支持范围。验证类别、fallback、协议可达性，不再在三个策略家族中择一。
+4. **5D 有限 live 与消融。** 只启用状态查表；单独验收 bypass 与 table 的关系，记录完整响应、episode、队列/ITL、失败和质量。当前不加 AMPD 门控或 TTL。
+5. **5E 严格 serving 比较。** 明确 replay 的生成工作量和工具间隔语义后，比较端到端延迟、goodput、重算与不确定性；保留 Static x=1、原始 Dynamic 和必要的强制 PD 对照。
 
-    Agent contract frozen
-        -> deterministic matched routing
-        -> Static c=12 healthy; c=14 knee; c=16 stress
-        -> original Dynamic reproduction complete
-        -> Agent-compatible Dynamic single-variable ablations
-        -> request/tool-gap replay for causal comparison
-        -> Static PPD + TTL
-        -> Dynamic + TTL
+双向传输、P:D sizing、D migration、admission、offload、队列重排不在第一版中一起修改。原始 Dynamic 与静态基线保留，新方案单独命名；若新场景仍全部 Local，允许作为结论，不人为提高 PD 占比。详细定义见 [阶段 5 当前方案](./stage5-state-aware-routing-and-ttl-design.md)。
+
+### 阶段 6：TTL 及与 Dynamic 的组合（后置，当前仅留接口）
+
+本轮仅约定有效前缀、保护容量、epoch 和 request/tool/episode 生命周期接口，不实施 pin/unpin，不改变缓存策略。以下保留为后续候选计划，不与当前状态查表同时启用；将来可先在 Static x=1 独立验证，再在路由与 TTL 各自验收后研究组合。
+
+1. 补齐 episode/tool-gap 生命周期与可验证的 cache loss 事件；返回 gap 包含 Modal/RPC/客户端开销，不能只用 shell 执行时间。
+2. 接入有界 pin/unpin、共享 block 引用、传输保护和取消/结束清理；expiry 解除保护，不强制删除仍可自然命中的 cache。
+3. 分开比较不加 TTL、固定 TTL、Continuum-style utility，并隔离回访优先级的贡献。公开仓库的固定阈值实现不冒称论文完整版。
+4. 用当前 healthy/knee/stress 工作点检查收益和代价：减少真实重算是否足以抵消 pin 引起的排队、preemption、ITL 或其他 episode 的损失。
+5. 再研究 route-aware retention：缓存保护应取决于它能改变哪条路径的成本，而不是把 gap 预测数值同时塞进 Dynamic 与 TTL。
+
+最终组合需要回答“在同等工作量下是否更快、更少超时且不伤害其他请求”，不能只报告 retention 上升或 eviction 下降。当前证据不足以宣称 PPD+TTL 优于 co-located Continuum，也不足以宣称此前论文已经否定这种组合。

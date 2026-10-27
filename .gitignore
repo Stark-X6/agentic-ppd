@@ -7,3 +7,6 @@ logs/
 *.csv
 *.jsonl
 .env
+
+# Jupyter autosave copies; keep the canonical Markdown documents only.
+.ipynb_checkpoints/
