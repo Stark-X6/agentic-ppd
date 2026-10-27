@@ -434,7 +434,7 @@ git -C uni-agent rev-parse --is-shallow-repository
 
 完整Git clone只涵盖远端仓库可达的版本历史和tracked内容；它不是服务器磁盘镜像。不会自动带上ignored数据、未提交改动、shell环境、conda、运行中的进程或Codex聊天数据库。一般开发不需要--mirror。子模块须另外递归初始化。
 
-在VS Code使用File→Open Folder打开agentic-workspace父目录，四个仓库仍独立管理。在本地Codex项目中打开同一目录，并把本文作为接手材料。本文新生成后尚未提交/推送；应下载到Mac的agentic-ppd/docs/，再按本地Git流程管理。
+在VS Code使用File→Open Folder打开agentic-workspace父目录，四个仓库仍独立管理。在本地Codex项目中打开同一目录，并把本文作为接手材料。本文和Mac/Vast协作说明已提交同步到agentic-ppd的main分支；Mac更新该仓库即可获取，无需另行下载。
 
 本地编辑、SSH连接Vast、同步确定版本、启动/监控实验和取回结果的具体操作，见[Mac与Vast实验协作说明](./mac-vast-experiment-workflow.md)。该文档第11节提供可直接给本地AI的接手指令。
 
